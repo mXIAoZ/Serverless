@@ -7,6 +7,7 @@ GATEWAY="http://localhost:8080"
 SCALER="http://localhost:9300"
 LOGS="http://localhost:9200"
 FUNC="hello"
+QUEUE_FUNC="hello-queue"
 BACKEND="${FAAS_BACKEND:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 
@@ -15,6 +16,7 @@ now_ms() { python3 -c 'import time; print(int(time.time() * 1000))'; }
 ok()  { echo "  [ok] $*"; }
 fail(){ echo "  [FAIL] $*"; exit 1; }
 sep() { echo ""; echo "── $* ──────────────────────────────────────"; }
+json_field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get(sys.argv[1], ""))' "$1"; }
 
 # ── 1. 健康检查 ──────────────────────────────────────────────────
 sep "health checks"
@@ -28,6 +30,9 @@ RESP=$(curl -s -X POST $GATEWAY/functions/$FUNC \
   -H "Content-Type: application/json" \
   -d '{"handler":"handler.handler"}')
 echo "  $RESP"
+case "$RESP" in
+  *'already registered'*) echo "  (reusing existing function)" ;;
+esac
 
 # ── 3. 上传代码 ──────────────────────────────────────────────────
 sep "upload code"
@@ -105,22 +110,120 @@ curl -sf -X POST $SCALER/metrics/$CID \
   && echo "  metrics injected"
 
 sleep 6
+STATUS=$(curl -sf $SCALER/scale/$FUNC)
 echo "  scale status after injection:"
-curl -sf $SCALER/scale/$FUNC | python3 -c "
+echo "$STATUS" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 dec = d.get('last_decision') or {}
 print(f'  action={dec.get(\"action\")} reason={dec.get(\"reason\")}')
 print(f'  total replicas: {d[\"total\"]}')
 "
+echo "$STATUS" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+dec = d.get('last_decision') or {}
+assert dec.get('action') == 'scale-up', dec
+assert 'p99=' in (dec.get('reason') or ''), dec
+" && ok "p99 metrics trigger scale-up"
 
-# ── 10. 查看日志 ──────────────────────────────────────────────────
+# ── 10. 并发压测队列触发扩容 ───────────────────────────────────────
+sep "queue backlog triggers scale-up"
+RESP=$(curl -s -X POST $GATEWAY/functions/$QUEUE_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"handler":"handler.handler"}')
+echo "  $RESP"
+case "$RESP" in
+  *'already registered'*) echo "  (reusing existing function)" ;;
+esac
+zip -j /tmp/$QUEUE_FUNC.zip runtime/examples/python/handler.py -q
+curl -sf -X PUT $GATEWAY/functions/$QUEUE_FUNC/code \
+  --data-binary @/tmp/$QUEUE_FUNC.zip >/dev/null
+Q_STATUS=$(curl -sf $GATEWAY/queues/$QUEUE_FUNC)
+MAX_INFLIGHT=$(echo "$Q_STATUS" | json_field max_inflight)
+QUEUE_TARGET=$((MAX_INFLIGHT + 4))
+python3 - "$GATEWAY" "$QUEUE_FUNC" "$QUEUE_TARGET" <<'PY' &
+import concurrent.futures, json, sys, urllib.request
+
+gateway, func_name, count = sys.argv[1], sys.argv[2], int(sys.argv[3])
+payload = json.dumps({"name": "Queue", "sleep_ms": 5000}).encode()
+url = f"{gateway}/invoke/{func_name}"
+
+def invoke(_):
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        resp.read()
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=count) as pool:
+    futures = [pool.submit(invoke, i) for i in range(count)]
+    for fut in futures:
+        fut.result()
+PY
+LOAD_PID=$!
+sleep 1
+QUEUE_JSON=$(curl -sf $GATEWAY/queues/$QUEUE_FUNC)
+echo "$QUEUE_JSON" | python3 -m json.tool
+QUEUED=$(echo "$QUEUE_JSON" | json_field queued)
+[ "$QUEUED" -ge 1 ] || fail "expected queued requests during burst"
+
+QUEUE_SCALE_OK=0
+for _ in 1 2 3 4 5 6 7 8; do
+  QUEUE_SCALE=$(curl -sf $SCALER/scale/$QUEUE_FUNC)
+  echo "$QUEUE_SCALE" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+dec = d.get('last_decision') or {}
+print(f'  queued={d.get(\"queued\")} action={dec.get(\"action\")} reason={dec.get(\"reason\")}')
+print(f'  total replicas: {d[\"total\"]}')
+"
+  if echo "$QUEUE_SCALE" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+dec = d.get('last_decision') or {}
+assert dec.get('action') == 'scale-up', dec
+assert 'queue=' in (dec.get('reason') or ''), dec
+" >/dev/null 2>&1; then
+    QUEUE_SCALE_OK=1
+    break
+  fi
+  sleep 1
+done
+[ "$QUEUE_SCALE_OK" -eq 1 ] || fail "expected scaler queue-based scale-up decision"
+ok "queue backlog triggers scale-up"
+wait $LOAD_PID
+
+# ── 11. 查看日志 ──────────────────────────────────────────────────
 sep "function logs (last 10)"
-RESP=$(curl -s "$LOGS/logs/$FUNC?tail=10" || true)
-if [ -z "$RESP" ]; then
-  echo '  (no logs yet — logdaemon may have started after containers)'
-else
+if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
+  LOG_OK=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    RESP=$(curl -s "$LOGS/logs/$FUNC?tail=10" || true)
+    if [ -n "$RESP" ] && echo "$RESP" | python3 -c "
+import sys, json
+entries = json.load(sys.stdin)
+assert entries, entries
+assert any(e.get('stream') == 'stdout' for e in entries), entries
+assert any('[runtime-api]' in e.get('line', '') or '[bootstrap]' in e.get('line', '') or 'Hello, Alice!' in e.get('line', '') for e in entries), entries
+" >/dev/null 2>&1; then
+      LOG_OK=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$LOG_OK" -eq 1 ] || fail "expected k8s collector/proxy logs for $FUNC"
   echo "$RESP" | python3 -c "
+import sys, json
+for e in json.load(sys.stdin):
+    ts = e['time'][:19].replace('T',' ')
+    print(f'  [{ts}] [{e[\"stream\"]}] {e[\"line\"]}')
+"
+  ok "k8s collector/proxy logs visible"
+else
+  RESP=$(curl -s "$LOGS/logs/$FUNC?tail=10" || true)
+  if [ -z "$RESP" ]; then
+    echo '  (no logs yet — logdaemon may have started after containers)'
+  else
+    echo "$RESP" | python3 -c "
 import sys, json
 try:
     entries = json.load(sys.stdin)
@@ -133,6 +236,7 @@ for e in entries:
     ts = e['time'][:19].replace('T',' ')
     print(f'  [{ts}] [{e[\"stream\"]}] {e[\"line\"]}')
 "
+  fi
 fi
 
 sep "all tests passed"

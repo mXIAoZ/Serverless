@@ -38,6 +38,7 @@ type container struct {
 	state    containerState
 	lastUsed time.Time
 	funcName string
+	nodeName string
 }
 
 // Scheduler 管理函数注册表和容器池
@@ -210,7 +211,28 @@ func (s *Scheduler) start(cfg FunctionConfig, port int, state containerState) (*
 		state:    state,
 		lastUsed: time.Now(),
 		funcName: inst.FuncName,
+		nodeName: inst.NodeName,
 	}, nil
+}
+
+type InstanceInfo struct {
+	ID       string `json:"id"`
+	FuncName string `json:"func_name"`
+	NodeName string `json:"node_name"`
+	State    string `json:"state"`
+}
+
+func (s *Scheduler) stateName(state containerState) string {
+	switch state {
+	case stateIdle:
+		return "idle"
+	case stateBusy:
+		return "busy"
+	case stateStarting:
+		return "starting"
+	default:
+		return "unknown"
+	}
 }
 
 // waitReady 轮询 /health 直到实例就绪
@@ -272,6 +294,33 @@ func (s *Scheduler) FunctionNames() []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+// ContainerIDs returns all runtime instance IDs for a function.
+func (s *Scheduler) ContainerIDs(funcName string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ids := make([]string, 0, len(s.pool[funcName]))
+	for _, c := range s.pool[funcName] {
+		ids = append(ids, c.id)
+	}
+	return ids
+}
+
+// Instances returns runtime instance metadata for a function.
+func (s *Scheduler) Instances(funcName string) []InstanceInfo {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	instances := make([]InstanceInfo, 0, len(s.pool[funcName]))
+	for _, c := range s.pool[funcName] {
+		instances = append(instances, InstanceInfo{
+			ID:       c.id,
+			FuncName: c.funcName,
+			NodeName: c.nodeName,
+			State:    s.stateName(c.state),
+		})
+	}
+	return instances
 }
 
 // Stats returns the number of busy and idle containers for a function.

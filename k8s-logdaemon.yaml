@@ -1,0 +1,81 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: faas-log-collector
+  namespace: __K8S_NAMESPACE__
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: faas-log-collector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: faas-log-collector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: faas-log-collector
+subjects:
+  - kind: ServiceAccount
+    name: faas-log-collector
+    namespace: __K8S_NAMESPACE__
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: faas-log-collector
+  namespace: __K8S_NAMESPACE__
+spec:
+  selector:
+    matchLabels:
+      app: faas-log-collector
+  template:
+    metadata:
+      labels:
+        app: faas-log-collector
+    spec:
+      serviceAccountName: faas-log-collector
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: collector
+          image: faas-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-c"]
+          args:
+            - |
+              import os, shutil
+              src = "/opt/faas/bin/logdaemon"
+              dst = "/tmp/logdaemon"
+              shutil.copyfile(src, dst)
+              os.chmod(dst, 0o755)
+              os.execv(dst, [dst])
+          env:
+            - name: LOGDAEMON_MODE
+              value: collector
+            - name: K8S_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: MY_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - containerPort: 9200
+              name: http
+          volumeMounts:
+            - name: host-bin
+              mountPath: /opt/faas/bin
+              readOnly: true
+      volumes:
+        - name: host-bin
+          hostPath:
+            path: /tmp/faas-bin
+            type: Directory

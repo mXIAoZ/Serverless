@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -61,6 +62,12 @@ func (b *k8sBackend) Start(ctx context.Context, cfg FunctionConfig) (*RuntimeIns
 		return nil, fmt.Errorf("kubectl port-forward: %w", err)
 	}
 
+	nodeName, err := b.podNodeName(ctx, podName)
+	if err != nil {
+		b.Stop(context.Background(), podName)
+		return nil, err
+	}
+
 	b.mu.Lock()
 	b.forwards[podName] = pf
 	b.mu.Unlock()
@@ -71,7 +78,7 @@ func (b *k8sBackend) Start(ctx context.Context, cfg FunctionConfig) (*RuntimeIns
 		return nil, fmt.Errorf("pod not ready through port-forward: %w\n%s", err, pfOut.String())
 	}
 
-	return &RuntimeInstance{ID: podName, Addr: addr, FuncName: cfg.Name}, nil
+	return &RuntimeInstance{ID: podName, Addr: addr, FuncName: cfg.Name, NodeName: nodeName}, nil
 }
 
 func (b *k8sBackend) Stop(ctx context.Context, id string) error {
@@ -93,6 +100,19 @@ func (b *k8sBackend) Stop(ctx context.Context, id string) error {
 	return nil
 }
 
+func (b *k8sBackend) podNodeName(ctx context.Context, podName string) (string, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", "get", "pod", podName, "-n", b.namespace, "-o", "jsonpath={.spec.nodeName}")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("kubectl get pod node %s: %w\n%s", podName, err, out)
+	}
+	nodeName := strings.TrimSpace(string(out))
+	if nodeName == "" {
+		return "", fmt.Errorf("pod %s has no assigned node", podName)
+	}
+	return nodeName, nil
+}
+
 func (b *k8sBackend) podManifest(podName string, cfg FunctionConfig) string {
 	gatewayAddr := os.Getenv("GATEWAY_ADDR")
 	if gatewayAddr == "" {
@@ -103,15 +123,15 @@ func (b *k8sBackend) podManifest(podName string, cfg FunctionConfig) string {
 	volume := ""
 	if cfg.CodeDir != "" {
 		mount = `
-        volumeMounts:
-        - name: function-code
-          mountPath: /function`
+    volumeMounts:
+    - name: function-code
+      mountPath: /function`
 		volume = fmt.Sprintf(`
-      volumes:
-      - name: function-code
-        hostPath:
-          path: %s
-          type: Directory`, cfg.CodeDir)
+  volumes:
+  - name: function-code
+    hostPath:
+      path: %s
+      type: Directory`, cfg.CodeDir)
 	}
 
 	return fmt.Sprintf(`apiVersion: v1
@@ -144,14 +164,37 @@ spec:
 }
 
 func syncCodeToMinikube(ctx context.Context, codeDir string) error {
-	mkdir := exec.CommandContext(ctx, "minikube", "ssh", "--", "sudo mkdir -p "+shellQuote(codeDir))
+	targetDir := filepath.Clean(codeDir)
+	parentDir := filepath.Dir(targetDir)
+	baseName := filepath.Base(targetDir)
+	tarPath := filepath.Join(os.TempDir(), baseName+".tgz")
+
+	tarCmd := exec.CommandContext(ctx, "tar", "-C", parentDir, "-czf", tarPath, baseName)
+	if out, err := tarCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("tar function code: %w\n%s", err, out)
+	}
+	defer os.Remove(tarPath)
+
+	mkdir := exec.CommandContext(ctx, "minikube", "ssh", "--", "sudo mkdir -p "+shellQuote(parentDir))
 	if out, err := mkdir.CombinedOutput(); err != nil {
 		return fmt.Errorf("minikube mkdir: %w\n%s", err, out)
 	}
 
-	cmd := exec.CommandContext(ctx, "minikube", "cp", codeDir, codeDir)
-	if out, err := cmd.CombinedOutput(); err != nil {
+	targetTar := filepath.Join(parentDir, baseName+".tgz")
+	cp := exec.CommandContext(ctx, "minikube", "cp", tarPath, targetTar)
+	if out, err := cp.CombinedOutput(); err != nil {
 		return fmt.Errorf("minikube cp: %w\n%s", err, out)
+	}
+
+	untarCmd := fmt.Sprintf("sudo rm -rf %s && sudo tar -C %s -xzf %s", shellQuote(targetDir), shellQuote(parentDir), shellQuote(targetTar))
+	untar := exec.CommandContext(ctx, "minikube", "ssh", "--", untarCmd)
+	if out, err := untar.CombinedOutput(); err != nil {
+		return fmt.Errorf("minikube untar: %w\n%s", err, out)
+	}
+
+	cleanup := exec.CommandContext(ctx, "minikube", "ssh", "--", "sudo rm -f "+shellQuote(targetTar))
+	if out, err := cleanup.CombinedOutput(); err != nil {
+		return fmt.Errorf("minikube cleanup: %w\n%s", err, out)
 	}
 	return nil
 }

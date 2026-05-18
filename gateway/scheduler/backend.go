@@ -6,6 +6,7 @@ type RuntimeInstance struct {
 	ID       string
 	Addr     string
 	FuncName string
+	NodeName string
 }
 
 type RuntimeBackend interface {

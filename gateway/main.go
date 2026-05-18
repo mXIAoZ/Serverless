@@ -134,6 +134,39 @@ func main() {
 		json.NewEncoder(w).Encode(map[string]int{"busy": busy, "idle": idle})
 	})
 
+	// GET /internal/containers/{funcName} — 返回该函数的 runtime 实例 ID 列表
+	mux.HandleFunc("/internal/containers/", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(req.URL.Path, "/internal/containers/")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sched.ContainerIDs(name))
+	})
+
+	// GET /internal/instances/{funcName} — 返回该函数实例与 node 映射
+	mux.HandleFunc("/internal/instances/", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(req.URL.Path, "/internal/instances/")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sched.Instances(name))
+	})
+
+	// GET /internal/queue/{funcName} — 返回 gateway queue 状态
+	mux.HandleFunc("/internal/queue/", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		name := strings.TrimPrefix(req.URL.Path, "/internal/queue/")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(qm.Status(name))
+	})
+
 	// GET /internal/functions — 返回所有已注册函数名
 	mux.HandleFunc("/internal/functions", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
