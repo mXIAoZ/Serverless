@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,13 +10,20 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/remotecommand"
 )
 
 // LogEntry is a single log line from a container.
@@ -284,6 +292,8 @@ type proxyClient struct {
 	gatewayAddr string
 	namespace   string
 	httpClient  *http.Client
+	k8sClient   kubernetes.Interface
+	restConfig  *rest.Config
 }
 
 type instanceInfo struct {
@@ -307,11 +317,44 @@ func newProxyClient() *proxyClient {
 	if gatewayAddr == "" {
 		gatewayAddr = "localhost:8080"
 	}
+	client, restConfig, err := newK8sClient()
+	if err != nil {
+		log.Fatalf("[daemon] k8s client: %v", err)
+	}
 	return &proxyClient{
 		gatewayAddr: gatewayAddr,
 		namespace:   ns,
 		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		k8sClient:   client,
+		restConfig:  restConfig,
 	}
+}
+
+func newK8sClient() (kubernetes.Interface, *rest.Config, error) {
+	cfg, err := newK8sRestConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return client, cfg, nil
+}
+
+func newK8sRestConfig() (*rest.Config, error) {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			kubeconfig = filepath.Join(home, ".kube", "config")
+		}
+	}
+	if kubeconfig != "" {
+		if cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig); err == nil {
+			return cfg, nil
+		}
+	}
+	return rest.InClusterConfig()
 }
 
 func (p *proxyClient) fetchLogs(funcName string, tail int, filterStream string) ([]LogEntry, error) {
@@ -405,52 +448,63 @@ func (p *proxyClient) fetchCollectorLogs(podName, funcName string, tail int, fil
 	if filterStream != "" {
 		url += "&stream=" + filterStream
 	}
-	out, err := exec.Command("kubectl", "exec", "-n", p.namespace, podName, "--", "python3", "-c", fmt.Sprintf("import urllib.request,sys;print(urllib.request.urlopen(%q, timeout=10).read().decode())", url)).CombinedOutput()
+	out, errOut, err := p.execCollector(podName, []string{"python3", "-c", fmt.Sprintf("import urllib.request,sys;print(urllib.request.urlopen(%q, timeout=10).read().decode())", url)})
 	if err != nil {
-		return nil, fmt.Errorf("kubectl exec %s: %w: %s", podName, err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("exec collector %s: %w: %s", podName, err, strings.TrimSpace(errOut.String()))
 	}
 	var entries []LogEntry
-	if err := json.Unmarshal(out, &entries); err != nil {
+	if err := json.Unmarshal(out.Bytes(), &entries); err != nil {
 		return nil, err
 	}
 	return entries, nil
 }
 
-func (p *proxyClient) collectorsByNode() (map[string]collectorPod, error) {
-	out, err := kubectlOutput("get", "pods", "-n", p.namespace, "-l", "app=faas-log-collector", "-o", "json")
+var podExecParameterCodec = func() runtime.ParameterCodec {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	return runtime.NewParameterCodec(scheme)
+}()
+
+func (p *proxyClient) execCollector(podName string, command []string) (*bytes.Buffer, *bytes.Buffer, error) {
+	req := p.k8sClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(p.namespace).
+		SubResource("exec")
+	req.VersionedParams(&corev1.PodExecOptions{
+		Container: "collector",
+		Command:   command,
+		Stdout:    true,
+		Stderr:    true,
+	}, podExecParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(p.restConfig, http.MethodPost, req.URL())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var payload struct {
-		Items []struct {
-			Metadata struct {
-				Name string `json:"name"`
-			} `json:"metadata"`
-			Spec struct {
-				NodeName string `json:"nodeName"`
-			} `json:"spec"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(out, &payload); err != nil {
-		return nil, err
-	}
-	collectors := make(map[string]collectorPod, len(payload.Items))
-	for _, item := range payload.Items {
-		if item.Spec.NodeName == "" || item.Metadata.Name == "" {
-			continue
-		}
-		collectors[item.Spec.NodeName] = collectorPod{NodeName: item.Spec.NodeName, PodName: item.Metadata.Name}
-	}
-	return collectors, nil
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(context.Background(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	return &stdout, &stderr, err
 }
 
-func kubectlOutput(args ...string) ([]byte, error) {
-	cmd := exec.Command("kubectl", args...)
-	out, err := cmd.CombinedOutput()
+func (p *proxyClient) collectorsByNode() (map[string]collectorPod, error) {
+	pods, err := p.k8sClient.CoreV1().Pods(p.namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=faas-log-collector",
+	})
 	if err != nil {
-		return nil, fmt.Errorf("kubectl %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		return nil, fmt.Errorf("list collector pods: %w", err)
 	}
-	return out, nil
+	collectors := make(map[string]collectorPod, len(pods.Items))
+	for _, pod := range pods.Items {
+		if pod.Spec.NodeName == "" || pod.Name == "" {
+			continue
+		}
+		collectors[pod.Spec.NodeName] = collectorPod{NodeName: pod.Spec.NodeName, PodName: pod.Name}
+	}
+	return collectors, nil
 }
 
 func streamLines(ctx context.Context, rc io.ReadCloser, onLine func(string)) {

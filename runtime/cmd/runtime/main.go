@@ -189,14 +189,16 @@ func startFunction() {
 		funcDir = "/function"
 	}
 
-	// bootstrap 脚本路径：/runtime/bootstrap/{runtime}.py 等
-	bootstrapPath := fmt.Sprintf("/runtime/bootstrap/%s_bootstrap.py", runtime)
+	bootstrapCmd := []string{runtime, fmt.Sprintf("/runtime/bootstrap/%s_bootstrap.py", runtime)}
+	if runtime == "go" {
+		bootstrapCmd = []string{"/runtime/bootstrap/go-bootstrap"}
+	}
 
 	for {
 		log.Printf("[runtime] starting function: %s %s (handler=%s, dir=%s)",
-			runtime, bootstrapPath, handler, funcDir)
+			runtime, strings.Join(bootstrapCmd, " "), handler, funcDir)
 
-		cmd := exec.Command(runtime, bootstrapPath)
+		cmd := exec.Command(bootstrapCmd[0], bootstrapCmd[1:]...)
 		cmd.Dir = funcDir
 		cmd.Env = append(os.Environ(),
 			"RUNTIME_API=http://localhost:9000",

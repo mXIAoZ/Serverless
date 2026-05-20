@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,62 +15,63 @@ import (
 )
 
 type ContainerMetrics struct {
-	ContainerID     string    `json:"container_id"`
-	Timestamp       time.Time `json:"timestamp"`
-	InvocationCount int64     `json:"invocation_count"`
-	SuccessCount    int64     `json:"success_count"`
-	ErrorCount      int64     `json:"error_count"`
-	P50LatencyMs    float64   `json:"p50_latency_ms"`
-	P95LatencyMs    float64   `json:"p95_latency_ms"`
-	P99LatencyMs    float64   `json:"p99_latency_ms"`
-	MemoryBytes     int64     `json:"memory_bytes"`
-	CPUUsageUs      int64     `json:"cpu_usage_us"`
+	ContainerID     string    `json:"container_id" bson:"container_id"`
+	Timestamp       time.Time `json:"timestamp" bson:"timestamp"`
+	InvocationCount int64     `json:"invocation_count" bson:"invocation_count"`
+	SuccessCount    int64     `json:"success_count" bson:"success_count"`
+	ErrorCount      int64     `json:"error_count" bson:"error_count"`
+	P50LatencyMs    float64   `json:"p50_latency_ms" bson:"p50_latency_ms"`
+	P95LatencyMs    float64   `json:"p95_latency_ms" bson:"p95_latency_ms"`
+	P99LatencyMs    float64   `json:"p99_latency_ms" bson:"p99_latency_ms"`
+	MemoryBytes     int64     `json:"memory_bytes" bson:"memory_bytes"`
+	CPUUsageUs      int64     `json:"cpu_usage_us" bson:"cpu_usage_us"`
 }
 
 // policy thresholds — all configurable via env vars
 type policy struct {
-	ScaleUpUtilPct   float64 `json:"scale_up_util_pct"`
-	ScaleUpP99Ms     float64 `json:"scale_up_p99_ms"`
-	ScaleUpErrPct    float64 `json:"scale_up_err_pct"`
-	ScaleUpQueueLen  int     `json:"scale_up_queue_len"`
-	ScaleDownUtilPct float64 `json:"scale_down_util_pct"`
-	ScaleDownP99Ms   float64 `json:"scale_down_p99_ms"`
-	IdleMinutes      float64 `json:"idle_minutes"`
+	TargetConcurrency int     `json:"target_concurrency" bson:"target_concurrency"`
+	ScaleUpUtilPct    float64 `json:"scale_up_util_pct" bson:"scale_up_util_pct"`
+	ScaleUpP99Ms      float64 `json:"scale_up_p99_ms" bson:"scale_up_p99_ms"`
+	ScaleUpErrPct     float64 `json:"scale_up_err_pct" bson:"scale_up_err_pct"`
+	ScaleDownUtilPct  float64 `json:"scale_down_util_pct" bson:"scale_down_util_pct"`
+	ScaleDownP99Ms    float64 `json:"scale_down_p99_ms" bson:"scale_down_p99_ms"`
+	IdleMinutes       float64 `json:"idle_minutes" bson:"idle_minutes"`
 }
 
 func defaultPolicy() policy {
 	return policy{
-		ScaleUpUtilPct:   envFloat("SCALE_UP_UTIL_PCT", 80),
-		ScaleUpP99Ms:     envFloat("SCALE_UP_P99_MS", 500),
-		ScaleUpErrPct:    envFloat("SCALE_UP_ERR_PCT", 10),
-		ScaleUpQueueLen:  envInt("SCALE_UP_QUEUE_LEN", 1),
-		ScaleDownUtilPct: envFloat("SCALE_DOWN_UTIL_PCT", 20),
-		ScaleDownP99Ms:   envFloat("SCALE_DOWN_P99_MS", 100),
-		IdleMinutes:      envFloat("IDLE_MINUTES", 2),
+		TargetConcurrency: envInt("TARGET_CONCURRENCY", 1),
+		ScaleUpUtilPct:    envFloat("SCALE_UP_UTIL_PCT", 80),
+		ScaleUpP99Ms:      envFloat("SCALE_UP_P99_MS", 500),
+		ScaleUpErrPct:     envFloat("SCALE_UP_ERR_PCT", 10),
+		ScaleDownUtilPct:  envFloat("SCALE_DOWN_UTIL_PCT", 20),
+		ScaleDownP99Ms:    envFloat("SCALE_DOWN_P99_MS", 100),
+		IdleMinutes:       envFloat("IDLE_MINUTES", 2),
 	}
 }
 
 // ScaleDecision records why a scaling action was taken.
 type ScaleDecision struct {
-	Time     time.Time `json:"time"`
-	FuncName string    `json:"func_name"`
-	Action   string    `json:"action"` // "scale-up" | "scale-down" | "none"
-	Reason   string    `json:"reason"`
-	Busy     int       `json:"busy"`
-	Idle     int       `json:"idle"`
+	Time     time.Time `json:"time" bson:"time"`
+	FuncName string    `json:"func_name" bson:"func_name"`
+	Action   string    `json:"action" bson:"action"` // "scale-up" | "scale-down" | "none"
+	Reason   string    `json:"reason" bson:"reason"`
+	Busy     int       `json:"busy" bson:"busy"`
+	Idle     int       `json:"idle" bson:"idle"`
+	Desired  int       `json:"desired" bson:"desired"`
 }
 
 type ScaleStatus struct {
-	FuncName     string                      `json:"func_name"`
-	Busy         int                         `json:"busy"`
-	Idle         int                         `json:"idle"`
-	Queued       int                         `json:"queued"`
-	Total        int                         `json:"total"`
-	MaxReplicas  int                         `json:"max_replicas"`
-	MinReplicas  int                         `json:"min_replicas"`
-	Policy       policy                      `json:"policy"`
-	LastDecision *ScaleDecision              `json:"last_decision,omitempty"`
-	Metrics      map[string]ContainerMetrics `json:"metrics"`
+	FuncName     string                      `json:"func_name" bson:"func_name"`
+	Busy         int                         `json:"busy" bson:"busy"`
+	Idle         int                         `json:"idle" bson:"idle"`
+	Queued       int                         `json:"queued" bson:"queued"`
+	Total        int                         `json:"total" bson:"total"`
+	MaxReplicas  int                         `json:"max_replicas" bson:"max_replicas"`
+	MinReplicas  int                         `json:"min_replicas" bson:"min_replicas"`
+	Policy       policy                      `json:"policy" bson:"policy"`
+	LastDecision *ScaleDecision              `json:"last_decision,omitempty" bson:"last_decision,omitempty"`
+	Metrics      map[string]ContainerMetrics `json:"metrics" bson:"metrics"`
 }
 
 type scaler struct {
@@ -80,16 +82,36 @@ type scaler struct {
 	decisions   map[string]*ScaleDecision   // funcName → last decision
 	maxReplicas int
 	minReplicas int
+	store       ScaleStore
 }
 
 func newScaler(gatewayAddr string) *scaler {
+	store, err := newScaleStoreFromEnv()
+	if err != nil {
+		log.Fatalf("[scaler] scale store: %v", err)
+	}
+	metrics, err := store.LoadLatestMetrics(context.Background())
+	if err != nil {
+		log.Fatalf("[scaler] load metrics: %v", err)
+	}
+	if metrics == nil {
+		metrics = make(map[string]ContainerMetrics)
+	}
+	decisions, err := store.LoadLatestDecisions(context.Background())
+	if err != nil {
+		log.Fatalf("[scaler] load decisions: %v", err)
+	}
+	if decisions == nil {
+		decisions = make(map[string]*ScaleDecision)
+	}
 	s := &scaler{
 		gatewayAddr: gatewayAddr,
 		pol:         defaultPolicy(),
-		metrics:     make(map[string]ContainerMetrics),
-		decisions:   make(map[string]*ScaleDecision),
+		metrics:     metrics,
+		decisions:   decisions,
 		maxReplicas: envInt("MAX_REPLICAS", 5),
 		minReplicas: envInt("MIN_REPLICAS", 0),
+		store:       store,
 	}
 	go s.evaluateLoop()
 	return s
@@ -120,49 +142,42 @@ func (s *scaler) evaluate(funcName string) {
 	}
 
 	pol := s.pol
+	desired := s.desiredReplicas(total, busy, queued, p99, errPct)
 	var action, reason string
 
 	switch {
-	// --- scale-up: any one condition triggers ---
-	case total > 0 && total < s.maxReplicas && queued >= pol.ScaleUpQueueLen:
+	case desired > total:
 		action = "scale-up"
-		reason = fmt.Sprintf("queue=%d >= %d", queued, pol.ScaleUpQueueLen)
-	case total > 0 && total < s.maxReplicas && util >= pol.ScaleUpUtilPct:
-		action = "scale-up"
-		reason = fmt.Sprintf("util=%.0f%% >= %.0f%%", util, pol.ScaleUpUtilPct)
-	case total > 0 && total < s.maxReplicas && p99 > pol.ScaleUpP99Ms:
-		action = "scale-up"
-		reason = fmt.Sprintf("p99=%.1fms > %.0fms", p99, pol.ScaleUpP99Ms)
-	case total > 0 && total < s.maxReplicas && errPct > pol.ScaleUpErrPct:
-		action = "scale-up"
-		reason = fmt.Sprintf("err=%.1f%% > %.0f%%", errPct, pol.ScaleUpErrPct)
-
-	// --- scale-down: all conditions must hold ---
-	case idle > s.minReplicas &&
-		queued == 0 &&
-		util < pol.ScaleDownUtilPct &&
-		(p99 == 0 || p99 < pol.ScaleDownP99Ms):
+		reason = fmt.Sprintf("desired=%d > total=%d (busy=%d queued=%d target=%d p99=%.1fms err=%.1f%%)", desired, total, busy, queued, pol.TargetConcurrency, p99, errPct)
+	case desired < total && idle > 0:
 		action = "scale-down"
-		reason = fmt.Sprintf("queue=%d util=%.0f%% < %.0f%%, p99=%.1fms", queued, util, pol.ScaleDownUtilPct, p99)
-
+		reason = fmt.Sprintf("desired=%d < total=%d (busy=%d idle=%d queued=%d util=%.0f%% p99=%.1fms)", desired, total, busy, idle, queued, util, p99)
 	default:
 		action = "none"
-		reason = fmt.Sprintf("queue=%d util=%.0f%% p99=%.1fms err=%.1f%%", queued, util, p99, errPct)
+		reason = fmt.Sprintf("desired=%d total=%d queue=%d util=%.0f%% p99=%.1fms err=%.1f%%", desired, total, queued, util, p99, errPct)
 	}
 
 	d := &ScaleDecision{
 		Time: time.Now(), FuncName: funcName,
 		Action: action, Reason: reason,
-		Busy: busy, Idle: idle,
+		Busy: busy, Idle: idle, Desired: desired,
 	}
 	s.mu.Lock()
 	s.decisions[funcName] = d
 	s.mu.Unlock()
 
+	status := s.status(funcName, busy, idle, queued, d)
+	if err := s.store.SaveDecision(context.Background(), *d); err != nil {
+		log.Printf("[scaler] save decision %s: %v", funcName, err)
+	}
+	if err := s.store.SaveStatus(context.Background(), status); err != nil {
+		log.Printf("[scaler] save status %s: %v", funcName, err)
+	}
+
 	if action == "none" {
 		return
 	}
-	log.Printf("[scaler] %s %s: %s (busy=%d idle=%d queued=%d)", action, funcName, reason, busy, idle, queued)
+	log.Printf("[scaler] %s %s: %s", action, funcName, reason)
 
 	switch action {
 	case "scale-up":
@@ -170,6 +185,39 @@ func (s *scaler) evaluate(funcName string) {
 	case "scale-down":
 		s.callGateway("POST", "/internal/scale-down/"+funcName, nil)
 	}
+}
+
+func (s *scaler) desiredReplicas(total, busy, queued int, p99, errPct float64) int {
+	pol := s.pol
+	target := pol.TargetConcurrency
+	if target <= 0 {
+		target = 1
+	}
+
+	desired := ceilDiv(busy+queued, target)
+	if total > 0 {
+		util := float64(busy) / float64(total) * 100
+		if (util >= pol.ScaleUpUtilPct || p99 > pol.ScaleUpP99Ms || errPct >= pol.ScaleUpErrPct) && desired <= total {
+			desired = total + 1
+		}
+		if queued == 0 && util >= pol.ScaleDownUtilPct && desired < total {
+			desired = total
+		}
+	}
+	if desired < s.minReplicas {
+		desired = s.minReplicas
+	}
+	if desired > s.maxReplicas {
+		desired = s.maxReplicas
+	}
+	return desired
+}
+
+func ceilDiv(n, d int) int {
+	if n <= 0 {
+		return 0
+	}
+	return (n + d - 1) / d
 }
 
 // aggregateMetrics returns the max p99 and overall error rate across runtime
@@ -273,6 +321,31 @@ func (s *scaler) callGateway(method, path string, body io.Reader) {
 	resp.Body.Close()
 }
 
+func (s *scaler) status(funcName string, busy, idle, queued int, dec *ScaleDecision) ScaleStatus {
+	instanceIDs := s.containerIDs(funcName)
+	s.mu.RLock()
+	snapshot := make(map[string]ContainerMetrics, len(instanceIDs))
+	for _, id := range instanceIDs {
+		if m, ok := s.metrics[id]; ok {
+			snapshot[id] = m
+		}
+	}
+	s.mu.RUnlock()
+
+	return ScaleStatus{
+		FuncName:     funcName,
+		Busy:         busy,
+		Idle:         idle,
+		Queued:       queued,
+		Total:        busy + idle,
+		MaxReplicas:  s.maxReplicas,
+		MinReplicas:  s.minReplicas,
+		Policy:       s.pol,
+		LastDecision: dec,
+		Metrics:      snapshot,
+	}
+}
+
 // --- HTTP handlers ---
 
 func (s *scaler) handleMetrics(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +365,9 @@ func (s *scaler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.metrics[m.ContainerID] = m
 	s.mu.Unlock()
+	if err := s.store.SaveMetrics(context.Background(), m); err != nil {
+		log.Printf("[scaler] save metrics %s: %v", m.ContainerID, err)
+	}
 	log.Printf("[scaler] recv container=%s inv=%d p99=%.1fms err=%d mem=%dMB",
 		m.ContainerID, m.InvocationCount, m.P99LatencyMs, m.ErrorCount, m.MemoryBytes>>20)
 	w.WriteHeader(http.StatusNoContent)
@@ -304,28 +380,18 @@ func (s *scaler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	funcName := strings.TrimPrefix(r.URL.Path, "/scale/")
 	busy, idle := s.stats(funcName)
+	queued := s.queueStatus(funcName)
 
 	s.mu.RLock()
-	snapshot := make(map[string]ContainerMetrics, len(s.metrics))
-	for k, v := range s.metrics {
-		snapshot[k] = v
-	}
 	dec := s.decisions[funcName]
 	s.mu.RUnlock()
+	status := s.status(funcName, busy, idle, queued, dec)
+	if err := s.store.SaveStatus(context.Background(), status); err != nil {
+		log.Printf("[scaler] save status %s: %v", funcName, err)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ScaleStatus{
-		FuncName:     funcName,
-		Busy:         busy,
-		Idle:         idle,
-		Queued:       s.queueStatus(funcName),
-		Total:        busy + idle,
-		MaxReplicas:  s.maxReplicas,
-		MinReplicas:  s.minReplicas,
-		Policy:       s.pol,
-		LastDecision: dec,
-		Metrics:      snapshot,
-	})
+	json.NewEncoder(w).Encode(status)
 }
 
 func main() {
@@ -346,8 +412,8 @@ func main() {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 
 	log.Printf("[scaler] listening on %s (gateway=%s)", listenAddr, gatewayAddr)
-	log.Printf("[scaler] policy: scale-up queue≥%d OR util≥%.0f%% OR p99>%.0fms OR err>%.0f%% | scale-down queue=0 AND util<%.0f%% AND p99<%.0fms",
-		s.pol.ScaleUpQueueLen, s.pol.ScaleUpUtilPct, s.pol.ScaleUpP99Ms, s.pol.ScaleUpErrPct,
+	log.Printf("[scaler] policy: target concurrency=%d | scale-up p99>%.0fms OR err>%.0f%% | scale-down queue=0 AND util<%.0f%% AND p99<%.0fms",
+		s.pol.TargetConcurrency, s.pol.ScaleUpP99Ms, s.pol.ScaleUpErrPct,
 		s.pol.ScaleDownUtilPct, s.pol.ScaleDownP99Ms)
 
 	if err := http.ListenAndServe(listenAddr, mux); err != nil {

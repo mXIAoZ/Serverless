@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: faas-minio-credentials
+  namespace: __K8S_NAMESPACE__
+  labels:
+    app: faas-minio
+type: Opaque
+stringData:
+  root-user: __MINIO_ROOT_USER__
+  root-password: __MINIO_ROOT_PASSWORD__
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: faas-minio
+  namespace: __K8S_NAMESPACE__
+  labels:
+    app: faas-minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: faas-minio
+  template:
+    metadata:
+      labels:
+        app: faas-minio
+    spec:
+      containers:
+      - name: minio
+        image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+        args: ["server", "/data"]
+        env:
+        - name: MINIO_ROOT_USER
+          valueFrom:
+            secretKeyRef:
+              name: faas-minio-credentials
+              key: root-user
+        - name: MINIO_ROOT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: faas-minio-credentials
+              key: root-password
+        ports:
+        - name: api
+          containerPort: 9000
+        readinessProbe:
+          httpGet:
+            path: /minio/health/ready
+            port: api
+          initialDelaySeconds: 3
+          periodSeconds: 3
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: faas-minio
+  namespace: __K8S_NAMESPACE__
+  labels:
+    app: faas-minio
+spec:
+  selector:
+    app: faas-minio
+  ports:
+  - name: api
+    port: 9000
+    targetPort: api

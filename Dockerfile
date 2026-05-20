@@ -3,10 +3,12 @@ FROM docker.m.daocloud.io/library/python:3.12-slim
 # 本地预编译的二进制（Linux arm64）
 COPY bin/runtime-server-linux /usr/local/bin/runtime-server
 COPY bin/runtime-agent-linux  /usr/local/bin/runtime-agent
+COPY bin/go-bootstrap-linux   /runtime/bootstrap/go-bootstrap
 COPY runtime/entrypoint.sh    /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/runtime-server \
              /usr/local/bin/runtime-agent \
-             /usr/local/bin/entrypoint.sh
+             /usr/local/bin/entrypoint.sh \
+             /runtime/bootstrap/go-bootstrap
 
 # bootstrap 脚本
 COPY runtime/bootstrap/ /runtime/bootstrap/

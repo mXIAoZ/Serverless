@@ -316,6 +316,13 @@ Kubernetes 模式：
 - `FAAS_BACKEND`
 - `K8S_NAMESPACE`
 - `GATEWAY_ADDR`
+- `MONGO_URI`
+  - 为空时使用内存模式
+  - 非空时 gateway/scalersvc 会把函数元信息、指标和扩缩容状态写入外部 MongoDB
+- `MONGO_DB`
+  - 默认 `faas`
+- `MONGO_TIMEOUT_MS`
+  - 默认 `3000`
 
 ### 测试脚本相关
 
@@ -333,6 +340,16 @@ Kubernetes 模式：
 ./test.sh
 ./stop.sh
 ```
+
+### 使用外部 MongoDB 持久化
+
+```bash
+MONGO_URI=mongodb://localhost:27017 MONGO_DB=faas ./start.sh
+./test.sh
+./stop.sh
+```
+
+`start.sh` 不会自动启动 MongoDB；需要你提前启动本机或外部 MongoDB 服务。未设置 `MONGO_URI` 时，gateway 和 scalersvc 继续使用内存状态。
 
 ### Kubernetes 后端
 

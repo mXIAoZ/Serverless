@@ -1,10 +1,10 @@
 package scheduler
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,12 +12,30 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 )
 
 type k8sBackend struct {
-	namespace string
-	mu        sync.Mutex
-	forwards  map[string]*exec.Cmd
+	namespace  string
+	client     kubernetes.Interface
+	restConfig *rest.Config
+	mu         sync.Mutex
+	forwards   map[string]*podPortForward
+}
+
+type podPortForward struct {
+	stopCh chan struct{}
+	doneCh chan struct{}
+	out    *strings.Builder
 }
 
 func newK8sBackend() RuntimeBackend {
@@ -25,7 +43,38 @@ func newK8sBackend() RuntimeBackend {
 	if ns == "" {
 		ns = "default"
 	}
-	return &k8sBackend{namespace: ns, forwards: make(map[string]*exec.Cmd)}
+	client, restConfig, err := newK8sClient()
+	if err != nil {
+		log.Fatalf("[scheduler] k8s client: %v", err)
+	}
+	return &k8sBackend{namespace: ns, client: client, restConfig: restConfig, forwards: make(map[string]*podPortForward)}
+}
+
+func newK8sClient() (kubernetes.Interface, *rest.Config, error) {
+	cfg, err := newK8sRestConfig()
+	if err != nil {
+		return nil, nil, err
+	}
+	client, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return client, cfg, nil
+}
+
+func newK8sRestConfig() (*rest.Config, error) {
+	kubeconfig := os.Getenv("KUBECONFIG")
+	if kubeconfig == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			kubeconfig = filepath.Join(home, ".kube", "config")
+		}
+	}
+	if kubeconfig != "" {
+		if cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig); err == nil {
+			return cfg, nil
+		}
+	}
+	return rest.InClusterConfig()
 }
 
 func (b *k8sBackend) Name() string { return "k8s" }
@@ -34,35 +83,24 @@ func (b *k8sBackend) Start(ctx context.Context, cfg FunctionConfig) (*RuntimeIns
 	podName := fmt.Sprintf("faas-%s-%d", dnsLabel(cfg.Name), cfg.Port)
 	addr := fmt.Sprintf("localhost:%d", cfg.Port)
 
-	if cfg.CodeDir != "" {
+	if cfg.CodeDir != "" && cfg.CodeKey == "" {
 		if err := syncCodeToMinikube(ctx, cfg.CodeDir); err != nil {
 			return nil, err
 		}
 	}
 
-	manifest := b.podManifest(podName, cfg)
-	apply := exec.CommandContext(ctx, "kubectl", "apply", "-n", b.namespace, "-f", "-")
-	apply.Stdin = strings.NewReader(manifest)
-	if out, err := apply.CombinedOutput(); err != nil {
-		return nil, fmt.Errorf("kubectl apply: %w\n%s", err, out)
+	pod := b.podSpec(podName, cfg)
+	if _, err := b.client.CoreV1().Pods(b.namespace).Create(ctx, pod, metav1.CreateOptions{}); err != nil {
+		return nil, fmt.Errorf("create pod %s: %w", podName, err)
 	}
 
-	wait := exec.CommandContext(ctx, "kubectl", "wait", "-n", b.namespace, "--for=condition=Ready", "pod/"+podName, "--timeout=30s")
-	if out, err := wait.CombinedOutput(); err != nil {
+	nodeName, err := b.waitPodReady(ctx, podName, 30*time.Second)
+	if err != nil {
 		b.Stop(context.Background(), podName)
-		return nil, fmt.Errorf("kubectl wait: %w\n%s", err, out)
+		return nil, err
 	}
 
-	pf := exec.CommandContext(context.Background(), "kubectl", "port-forward", "-n", b.namespace, "pod/"+podName, fmt.Sprintf("%d:9001", cfg.Port))
-	var pfOut bytes.Buffer
-	pf.Stdout = &pfOut
-	pf.Stderr = &pfOut
-	if err := pf.Start(); err != nil {
-		b.Stop(context.Background(), podName)
-		return nil, fmt.Errorf("kubectl port-forward: %w", err)
-	}
-
-	nodeName, err := b.podNodeName(ctx, podName)
+	pf, err := b.startPortForward(podName, cfg.Port)
 	if err != nil {
 		b.Stop(context.Background(), podName)
 		return nil, err
@@ -75,7 +113,7 @@ func (b *k8sBackend) Start(ctx context.Context, cfg FunctionConfig) (*RuntimeIns
 	log.Printf("[scheduler] k8s cold start %s pod=%s port=%d", cfg.Name, podName, cfg.Port)
 	if err := waitReady(ctx, addr, 15*time.Second); err != nil {
 		b.Stop(context.Background(), podName)
-		return nil, fmt.Errorf("pod not ready through port-forward: %w\n%s", err, pfOut.String())
+		return nil, fmt.Errorf("pod not ready through port-forward: %w\n%s", err, pf.out.String())
 	}
 
 	return &RuntimeInstance{ID: podName, Addr: addr, FuncName: cfg.Name, NodeName: nodeName}, nil
@@ -87,80 +125,209 @@ func (b *k8sBackend) Stop(ctx context.Context, id string) error {
 	delete(b.forwards, id)
 	b.mu.Unlock()
 
-	if pf != nil && pf.Process != nil {
-		_ = pf.Process.Kill()
-		_, _ = pf.Process.Wait()
+	if pf != nil {
+		close(pf.stopCh)
+		<-pf.doneCh
 	}
 
-	cmd := exec.CommandContext(ctx, "kubectl", "delete", "pod", id, "-n", b.namespace, "--ignore-not-found=true")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("[scheduler] delete pod %s: %v\n%s", id, err, out)
+	if err := b.deletePod(ctx, id); err != nil {
+		log.Printf("[scheduler] delete pod %s: %v", id, err)
 		return err
 	}
 	return nil
 }
 
-func (b *k8sBackend) podNodeName(ctx context.Context, podName string) (string, error) {
-	cmd := exec.CommandContext(ctx, "kubectl", "get", "pod", podName, "-n", b.namespace, "-o", "jsonpath={.spec.nodeName}")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("kubectl get pod node %s: %w\n%s", podName, err, out)
+func (b *k8sBackend) deletePod(ctx context.Context, podName string) error {
+	err := b.client.CoreV1().Pods(b.namespace).Delete(ctx, podName, metav1.DeleteOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil
 	}
-	nodeName := strings.TrimSpace(string(out))
-	if nodeName == "" {
-		return "", fmt.Errorf("pod %s has no assigned node", podName)
-	}
-	return nodeName, nil
+	return err
 }
 
-func (b *k8sBackend) podManifest(podName string, cfg FunctionConfig) string {
+func (b *k8sBackend) startPortForward(podName string, port int) (*podPortForward, error) {
+	req := b.client.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(b.namespace).
+		Name(podName).
+		SubResource("portforward")
+	transport, upgrader, err := spdy.RoundTripperFor(b.restConfig)
+	if err != nil {
+		return nil, err
+	}
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, http.MethodPost, req.URL())
+
+	readyCh := make(chan struct{})
+	pf := &podPortForward{
+		stopCh: make(chan struct{}),
+		doneCh: make(chan struct{}),
+		out:    &strings.Builder{},
+	}
+	forwarder, err := portforward.New(dialer, []string{fmt.Sprintf("%d:9001", port)}, pf.stopCh, readyCh, pf.out, pf.out)
+	if err != nil {
+		return nil, err
+	}
+	go func() {
+		defer close(pf.doneCh)
+		if err := forwarder.ForwardPorts(); err != nil {
+			_, _ = fmt.Fprintf(pf.out, "port-forward: %v", err)
+		}
+	}()
+
+	select {
+	case <-readyCh:
+		return pf, nil
+	case <-pf.doneCh:
+		return nil, fmt.Errorf("port-forward exited before ready: %s", pf.out.String())
+	case <-time.After(5 * time.Second):
+		close(pf.stopCh)
+		<-pf.doneCh
+		return nil, fmt.Errorf("timeout starting port-forward: %s", pf.out.String())
+	}
+}
+
+func (b *k8sBackend) waitPodReady(ctx context.Context, podName string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		pod, err := b.client.CoreV1().Pods(b.namespace).Get(ctx, podName, metav1.GetOptions{})
+		if err != nil && !apierrors.IsNotFound(err) {
+			return "", fmt.Errorf("get pod %s: %w", podName, err)
+		}
+		if pod != nil {
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionTrue {
+					if pod.Spec.NodeName == "" {
+						return "", fmt.Errorf("pod %s has no assigned node", podName)
+					}
+					return pod.Spec.NodeName, nil
+				}
+			}
+			if pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded {
+				return "", fmt.Errorf("pod %s finished before becoming ready: %s", podName, pod.Status.Phase)
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("timeout waiting for pod %s ready", podName)
+		case <-ticker.C:
+		}
+	}
+}
+
+func (b *k8sBackend) podSpec(podName string, cfg FunctionConfig) *corev1.Pod {
 	gatewayAddr := os.Getenv("GATEWAY_ADDR")
 	if gatewayAddr == "" {
 		gatewayAddr = "host.minikube.internal:8080"
 	}
 
-	mount := ""
-	volume := ""
-	if cfg.CodeDir != "" {
-		mount = `
-    volumeMounts:
-    - name: function-code
-      mountPath: /function`
-		volume = fmt.Sprintf(`
-  volumes:
-  - name: function-code
-    hostPath:
-      path: %s
-      type: Directory`, cfg.CodeDir)
+	container := corev1.Container{
+		Name:            "runtime",
+		Image:           cfg.Image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Ports: []corev1.ContainerPort{{
+			ContainerPort: 9001,
+		}},
+		Env: []corev1.EnvVar{
+			{Name: "FUNCTION_HANDLER", Value: cfg.Handler},
+			{Name: "FUNCTION_RUNTIME", Value: cfg.Runtime},
+			{Name: "GATEWAY_ADDR", Value: gatewayAddr},
+			{Name: "CONTAINER_ID", Value: podName},
+		},
+		Resources: corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				corev1.ResourceMemory: resource.MustParse(fmt.Sprintf("%dMi", cfg.Memory)),
+			},
+		},
 	}
 
-	return fmt.Sprintf(`apiVersion: v1
-kind: Pod
-metadata:
-  name: %s
-  labels:
-    faas.managed-by: local-faas
-    faas.function: %s
-    faas.instance: %s
-spec:
-  restartPolicy: Never
-  containers:
-  - name: runtime
-    image: %s
-    imagePullPolicy: IfNotPresent
-    ports:
-    - containerPort: 9001
-    env:
-    - name: FUNCTION_HANDLER
-      value: %q
-    - name: GATEWAY_ADDR
-      value: %q
-    - name: CONTAINER_ID
-      value: %q
-    resources:
-      limits:
-        memory: %dMi%s%s
-`, podName, cfg.Name, podName, cfg.Image, cfg.Handler, gatewayAddr, podName, cfg.Memory, mount, volume)
+	var volumes []corev1.Volume
+	var initContainers []corev1.Container
+	if cfg.CodeKey != "" {
+		container.VolumeMounts = []corev1.VolumeMount{{
+			Name:      "function-code",
+			MountPath: "/function",
+		}}
+		initContainers = []corev1.Container{b.codeInitContainer(cfg)}
+		volumes = []corev1.Volume{{
+			Name: "function-code",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		}}
+	} else if cfg.CodeDir != "" {
+		hostPathType := corev1.HostPathDirectory
+		container.VolumeMounts = []corev1.VolumeMount{{
+			Name:      "function-code",
+			MountPath: "/function",
+		}}
+		volumes = []corev1.Volume{{
+			Name: "function-code",
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: cfg.CodeDir,
+					Type: &hostPathType,
+				},
+			},
+		}}
+	}
+
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName,
+			Labels: map[string]string{
+				"faas.managed-by": "local-faas",
+				"faas.function":   cfg.Name,
+				"faas.instance":   podName,
+			},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy:  corev1.RestartPolicyNever,
+			InitContainers: initContainers,
+			Containers:     []corev1.Container{container},
+			Volumes:        volumes,
+		},
+	}
+}
+
+func (b *k8sBackend) codeInitContainer(cfg FunctionConfig) corev1.Container {
+	return corev1.Container{
+		Name:            "code-loader",
+		Image:           cfg.Image,
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command: []string{"python3", "-c", fmt.Sprintf(`
+import os
+import urllib.request
+import zipfile
+
+root = '/function'
+zip_path = '/tmp/function.zip'
+urllib.request.urlretrieve(%q, zip_path)
+
+root_real = os.path.realpath(root)
+with zipfile.ZipFile(zip_path) as archive:
+    for info in archive.infolist():
+        target = os.path.realpath(os.path.join(root, info.filename))
+        if target != root_real and not target.startswith(root_real + os.sep):
+            raise Exception('zip entry escapes function directory: ' + info.filename)
+        if info.is_dir():
+            os.makedirs(target, exist_ok=True)
+            continue
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with archive.open(info) as src, open(target, 'wb') as dst:
+            dst.write(src.read())
+        os.chmod(target, info.external_attr >> 16 or 0o644)
+`, cfg.CodeURL)},
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      "function-code",
+			MountPath: "/function",
+		}},
+	}
 }
 
 func syncCodeToMinikube(ctx context.Context, codeDir string) error {

@@ -1,12 +1,17 @@
 package scheduler
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,10 +20,13 @@ import (
 type FunctionConfig struct {
 	Name    string `json:"name"`
 	Image   string `json:"image"`
+	Runtime string `json:"runtime"`
 	Timeout int    `json:"timeout"`
 	Memory  int    `json:"memory"`
 	Handler string `json:"handler"` // e.g. "handler.handler"
 	CodeDir string `json:"-"`       // 解压后的代码目录，由 UploadCode 设置
+	CodeKey string `json:"-"`
+	CodeURL string `json:"-"`
 	Port    int    `json:"-"`
 }
 
@@ -48,15 +56,34 @@ type Scheduler struct {
 	pool      map[string][]*container // funcName → 容器列表
 	nextPort  int
 	backend   RuntimeBackend
+	store     FunctionStore
+	codeStore CodeStore
 }
 
 func New() *Scheduler {
 	backend := newRuntimeBackend()
+	store, err := newFunctionStoreFromEnv()
+	if err != nil {
+		log.Fatalf("[scheduler] function store: %v", err)
+	}
+	codeStore, err := newMinioCodeStoreFromEnv()
+	if err != nil {
+		log.Fatalf("[scheduler] code store: %v", err)
+	}
 	s := &Scheduler{
 		functions: make(map[string]FunctionConfig),
 		pool:      make(map[string][]*container),
 		nextPort:  9100,
 		backend:   backend,
+		store:     store,
+		codeStore: codeStore,
+	}
+	if configs, err := store.LoadFunctions(context.Background()); err != nil {
+		log.Fatalf("[scheduler] load functions: %v", err)
+	} else {
+		for _, cfg := range configs {
+			s.functions[cfg.Name] = cfg
+		}
 	}
 	log.Printf("[scheduler] backend=%s", backend.Name())
 	go s.reaper()
@@ -73,11 +100,20 @@ func newRuntimeBackend() RuntimeBackend {
 }
 
 func (s *Scheduler) Register(cfg FunctionConfig) error {
+	if !isValidFunctionName(cfg.Name) {
+		return fmt.Errorf("invalid function name %q", cfg.Name)
+	}
 	if cfg.Image == "" {
 		cfg.Image = "faas-runtime:latest"
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 30
+	}
+	if cfg.Runtime == "" {
+		cfg.Runtime = "python3"
+	}
+	if cfg.Runtime != "python3" && cfg.Runtime != "go" {
+		return fmt.Errorf("unsupported runtime %q", cfg.Runtime)
 	}
 	if cfg.Memory == 0 {
 		cfg.Memory = 128
@@ -86,11 +122,19 @@ func (s *Scheduler) Register(cfg FunctionConfig) error {
 		cfg.Handler = "handler.handler"
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, exists := s.functions[cfg.Name]; exists {
+		s.mu.Unlock()
 		return errors.New("function already registered")
 	}
 	s.functions[cfg.Name] = cfg
+	s.mu.Unlock()
+
+	if err := s.store.SaveFunction(context.Background(), cfg); err != nil {
+		s.mu.Lock()
+		delete(s.functions, cfg.Name)
+		s.mu.Unlock()
+		return fmt.Errorf("save function metadata: %w", err)
+	}
 	return nil
 }
 
@@ -101,6 +145,9 @@ func (s *Scheduler) Deregister(name string) {
 	delete(s.pool, name)
 	s.mu.Unlock()
 
+	if err := s.store.DeleteFunction(context.Background(), name); err != nil {
+		log.Printf("[scheduler] delete function metadata %s: %v", name, err)
+	}
 	for _, c := range containers {
 		go s.stop(c.id)
 	}
@@ -115,19 +162,44 @@ func (s *Scheduler) UploadCode(name string, zipData []byte) error {
 		return fmt.Errorf("function %q not registered", name)
 	}
 
-	dir := fmt.Sprintf("/tmp/faas/%s", name)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("mkdir: %w", err)
+	dir := fmt.Sprintf("/tmp/faas/%s", dnsLabel(name))
+	tmpDir, err := os.MkdirTemp(filepath.Dir(dir), "."+filepath.Base(dir)+"-")
+	if err != nil {
+		return fmt.Errorf("create temp code dir: %w", err)
 	}
+	defer os.RemoveAll(tmpDir)
 
-	zipPath := dir + "/code.zip"
-	if err := os.WriteFile(zipPath, zipData, 0644); err != nil {
-		return fmt.Errorf("write zip: %w", err)
+	if err := extractZip(zipData, tmpDir); err != nil {
+		return err
 	}
-	if out, err := exec.Command("unzip", "-o", zipPath, "-d", dir).CombinedOutput(); err != nil {
-		return fmt.Errorf("unzip: %w\n%s", err, out)
+	backupDir := dir + ".old"
+	if err := os.RemoveAll(backupDir); err != nil {
+		return fmt.Errorf("remove old backup dir: %w", err)
 	}
-	os.Remove(zipPath)
+	if _, err := os.Stat(dir); err == nil {
+		if err := os.Rename(dir, backupDir); err != nil {
+			return fmt.Errorf("backup old code dir: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat old code dir: %w", err)
+	}
+	if err := os.Rename(tmpDir, dir); err != nil {
+		if _, restoreErr := os.Stat(backupDir); restoreErr == nil {
+			_ = os.Rename(backupDir, dir)
+		}
+		return fmt.Errorf("replace code dir: %w", err)
+	}
+	if err := os.RemoveAll(backupDir); err != nil {
+		return fmt.Errorf("remove backup code dir: %w", err)
+	}
+	if s.codeStore != nil {
+		obj, err := s.codeStore.SaveCode(context.Background(), name, zipData)
+		if err != nil {
+			return fmt.Errorf("save code object: %w", err)
+		}
+		cfg.CodeKey = obj.Key
+		cfg.CodeURL = obj.URL
+	}
 
 	s.mu.Lock()
 	cfg.CodeDir = dir
@@ -136,11 +208,72 @@ func (s *Scheduler) UploadCode(name string, zipData []byte) error {
 	s.pool[name] = nil
 	s.mu.Unlock()
 
+	if err := s.store.SaveFunction(context.Background(), cfg); err != nil {
+		return fmt.Errorf("save function metadata: %w", err)
+	}
+
 	for _, c := range containers {
 		go s.stop(c.id)
 	}
 
 	log.Printf("[scheduler] code uploaded for %s → %s", name, dir)
+	return nil
+}
+
+func isValidFunctionName(name string) bool {
+	return name == dnsLabel(name)
+}
+
+func extractZip(zipData []byte, dir string) error {
+	zr, err := zip.NewReader(bytes.NewReader(zipData), int64(len(zipData)))
+	if err != nil {
+		return fmt.Errorf("read zip: %w", err)
+	}
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	for _, f := range zr.File {
+		target := filepath.Join(root, f.Name)
+		cleanTarget, err := filepath.Abs(target)
+		if err != nil {
+			return err
+		}
+		if cleanTarget != root && !strings.HasPrefix(cleanTarget, root+string(os.PathSeparator)) {
+			return fmt.Errorf("zip entry escapes function directory: %s", f.Name)
+		}
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(cleanTarget, 0755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(cleanTarget), 0755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		mode := f.FileInfo().Mode()
+		if mode == 0 {
+			mode = 0644
+		}
+		out, err := os.OpenFile(cleanTarget, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, mode)
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		_, copyErr := io.Copy(out, rc)
+		closeErr := out.Close()
+		rc.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+	}
 	return nil
 }
 
@@ -240,15 +373,24 @@ func waitReady(ctx context.Context, addr string, timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	client := &http.Client{Timeout: 2 * time.Second}
+	url := fmt.Sprintf("http://%s/health", addr)
 	for {
 		select {
 		case <-ctx.Done():
 			return errors.New("timeout waiting for runtime")
 		default:
 		}
-		out, err := exec.CommandContext(ctx, "curl", "-sf", fmt.Sprintf("http://%s/health", addr)).Output()
-		if err == nil && string(out) == "ok" {
-			return nil
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err == nil {
+			resp, err := client.Do(req)
+			if err == nil {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+				resp.Body.Close()
+				if resp.StatusCode == http.StatusOK && strings.TrimSpace(string(body)) == "ok" {
+					return nil
+				}
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

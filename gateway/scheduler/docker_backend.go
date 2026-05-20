@@ -4,16 +4,17 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
-	"os/exec"
-	"strings"
 	"time"
 )
 
-type dockerBackend struct{}
+type dockerBackend struct {
+	client *dockerHTTPClient
+}
 
 func newDockerBackend() RuntimeBackend {
-	return &dockerBackend{}
+	return &dockerBackend{client: newDockerHTTPClient()}
 }
 
 func (b *dockerBackend) Name() string { return "docker" }
@@ -26,31 +27,47 @@ func (b *dockerBackend) Start(ctx context.Context, cfg FunctionConfig) (*Runtime
 		gatewayAddr = "host.docker.internal:8080"
 	}
 
-	args := []string{
-		"run", "-d", "--rm",
-		"-p", fmt.Sprintf("%d:9001", cfg.Port),
-		"-m", fmt.Sprintf("%dm", cfg.Memory),
-		"-e", "FUNCTION_HANDLER=" + cfg.Handler,
-		"-e", "GATEWAY_ADDR=" + gatewayAddr,
-		"--label", "faas.function=" + cfg.Name,
-		"--name", fmt.Sprintf("faas-%s-%d", cfg.Name, cfg.Port),
+	name := fmt.Sprintf("faas-%s-%d", dnsLabel(cfg.Name), cfg.Port)
+	body := map[string]any{
+		"Image": cfg.Image,
+		"Env": []string{
+			"FUNCTION_HANDLER=" + cfg.Handler,
+			"FUNCTION_RUNTIME=" + cfg.Runtime,
+			"GATEWAY_ADDR=" + gatewayAddr,
+		},
+		"Labels": map[string]string{"faas.function": cfg.Name},
+		"HostConfig": map[string]any{
+			"AutoRemove": true,
+			"Memory":     int64(cfg.Memory) * 1024 * 1024,
+			"PortBindings": map[string][]map[string]string{
+				"9001/tcp": {{"HostIp": "127.0.0.1", "HostPort": fmt.Sprintf("%d", cfg.Port)}},
+			},
+		},
+		"ExposedPorts": map[string]any{"9001/tcp": map[string]any{}},
 	}
-
 	if cfg.CodeDir != "" {
-		args = append(args, "-v", cfg.CodeDir+":/function")
+		body["HostConfig"].(map[string]any)["Binds"] = []string{cfg.CodeDir + ":/function"}
 	}
 
-	args = append(args, cfg.Image)
-
+	var created struct {
+		ID string `json:"Id"`
+	}
 	log.Printf("[scheduler] docker cold start %s on port %d", cfg.Name, cfg.Port)
-	out, err := exec.CommandContext(ctx, "docker", args...).Output()
-	if err != nil {
-		return nil, fmt.Errorf("docker run: %w", err)
+	path := "/containers/create?" + url.Values{"name": {name}}.Encode()
+	if err := b.client.do(ctx, httpMethodPost, path, body, &created); err != nil {
+		return nil, fmt.Errorf("docker create: %w", err)
+	}
+	if err := b.client.do(ctx, httpMethodPost, "/containers/"+created.ID+"/start", nil, nil); err != nil {
+		_ = b.Stop(context.Background(), created.ID)
+		return nil, fmt.Errorf("docker start: %w", err)
 	}
 
-	id := strings.TrimSpace(string(out))[:12]
+	id := created.ID
+	if len(id) > 12 {
+		id = id[:12]
+	}
 	if err := waitReady(ctx, addr, 10*time.Second); err != nil {
-		b.Stop(context.Background(), id)
+		b.Stop(context.Background(), created.ID)
 		return nil, fmt.Errorf("container not ready: %w", err)
 	}
 
@@ -58,9 +75,11 @@ func (b *dockerBackend) Start(ctx context.Context, cfg FunctionConfig) (*Runtime
 }
 
 func (b *dockerBackend) Stop(ctx context.Context, id string) error {
-	if err := exec.CommandContext(ctx, "docker", "stop", id).Run(); err != nil {
+	if err := b.client.do(ctx, httpMethodPost, "/containers/"+id+"/stop", nil, nil); err != nil {
 		log.Printf("[scheduler] stop container %s: %v", id, err)
 		return err
 	}
 	return nil
 }
+
+const httpMethodPost = "POST"

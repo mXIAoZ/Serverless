@@ -8,6 +8,7 @@ SCALER="http://localhost:9300"
 LOGS="http://localhost:9200"
 FUNC="hello"
 QUEUE_FUNC="hello-queue"
+GO_FUNC="hello-go"
 BACKEND="${FAAS_BACKEND:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 
@@ -90,18 +91,25 @@ for cid, v in m.items():
 
 # ── 9. 注入高 p99 触发 scale-up ──────────────────────────────────
 sep "inject high-p99 metrics → trigger scale-up"
-CID=$(curl -sf $SCALER/scale/$FUNC | python3 -c "
+if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
+  CID=$(curl -sf $GATEWAY/internal/containers/$FUNC | python3 -c "
+import sys, json
+containers = json.load(sys.stdin)
+print(containers[0] if containers else '')
+")
+else
+  CID=$(docker ps -q --filter "label=faas.function=$FUNC" | head -1)
+fi
+if [ -z "$CID" ]; then
+  CID=$(curl -sf $SCALER/scale/$FUNC | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 metrics = d.get('metrics') or {}
-print(next(iter(metrics), ''))
+for cid in metrics:
+    if cid.startswith('faas-' + '$FUNC' + '-'):
+        print(cid)
+        break
 ")
-if [ -z "$CID" ]; then
-  if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
-    CID=$(kubectl get pod -n "$K8S_NAMESPACE" -l faas.function=$FUNC -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-  else
-    CID=$(docker ps -q --filter "label=faas.function" | head -1)
-  fi
 fi
 [ -n "$CID" ] || fail "no runtime instance found for metrics injection"
 curl -sf -X POST $SCALER/metrics/$CID \
@@ -181,7 +189,8 @@ import sys, json
 d = json.load(sys.stdin)
 dec = d.get('last_decision') or {}
 assert dec.get('action') == 'scale-up', dec
-assert 'queue=' in (dec.get('reason') or ''), dec
+reason = dec.get('reason') or ''
+assert 'queue=' in reason or 'queued=' in reason or 'desired=' in reason, dec
 " >/dev/null 2>&1; then
     QUEUE_SCALE_OK=1
     break
@@ -192,7 +201,30 @@ done
 ok "queue backlog triggers scale-up"
 wait $LOAD_PID
 
-# ── 11. 查看日志 ──────────────────────────────────────────────────
+# ── 11. Go runtime smoke test ───────────────────────────────────────
+sep "go runtime invoke"
+RESP=$(curl -s -X POST $GATEWAY/functions/$GO_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"runtime":"go","handler":"bootstrap"}')
+echo "  $RESP"
+case "$RESP" in
+  *'already registered'*) echo "  (reusing existing function)" ;;
+esac
+GO_BUILD_DIR="/tmp/faas-go-example"
+rm -rf "$GO_BUILD_DIR"
+mkdir -p "$GO_BUILD_DIR"
+GOOS=linux GOARCH=arm64 go build -o "$GO_BUILD_DIR/bootstrap" ./runtime/examples/go
+zip -j /tmp/$GO_FUNC.zip "$GO_BUILD_DIR/bootstrap" -q
+curl -sf -X PUT $GATEWAY/functions/$GO_FUNC/code \
+  --data-binary @/tmp/$GO_FUNC.zip >/dev/null
+RESP=$(curl -sf -X POST $GATEWAY/invoke/$GO_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Gopher"}')
+echo "  response: $RESP"
+echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['statusCode']==200 and d['message']=='Hello, Gopher!' and d.get('requestId')" \
+  && ok "go runtime response"
+
+# ── 12. 查看日志 ──────────────────────────────────────────────────
 sep "function logs (last 10)"
 if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   LOG_OK=0

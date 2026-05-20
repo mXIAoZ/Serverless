@@ -5,6 +5,17 @@ cd "$(dirname "$0")"
 BACKEND="${FAAS_BACKEND:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 
+cleanup_k8s_minio() {
+  if [ -f /tmp/faas-minio-port-forward.pid ]; then
+    kill "$(cat /tmp/faas-minio-port-forward.pid)" 2>/dev/null || true
+    rm /tmp/faas-minio-port-forward.pid
+  fi
+  pkill -f "kubectl port-forward.*svc/faas-minio" 2>/dev/null || true
+  if [ -f /tmp/faas-minio.yaml ]; then
+    kubectl delete -f /tmp/faas-minio.yaml --ignore-not-found=true >/dev/null 2>&1 || true
+  fi
+}
+
 cleanup_k8s_log_collector() {
   if [ -f /tmp/faas-logdaemon.yaml ]; then
     kubectl delete -f /tmp/faas-logdaemon.yaml --ignore-not-found=true >/dev/null 2>&1 || true
@@ -23,6 +34,7 @@ echo "==> stopping runtime instances..."
 if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   kubectl delete pod -n "$K8S_NAMESPACE" -l faas.managed-by=local-faas --ignore-not-found=true 2>/dev/null || true
   cleanup_k8s_log_collector
+  cleanup_k8s_minio
   pkill -f "kubectl port-forward.*faas-" 2>/dev/null || true
 else
   docker rm -f $(docker ps -aq --filter "label=faas.function") 2>/dev/null || true
