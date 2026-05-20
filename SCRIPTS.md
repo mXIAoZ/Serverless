@@ -392,7 +392,7 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./start.sh
 - `kubectl logs -n <ns> -l app=faas-log-collector`
 - `curl 'http://localhost:9200/logs/hello?tail=20'`
 
-当前架构下，proxy 还依赖 `kubectl exec` 进入 collector Pod 查询，所以如果本机 `kubectl` 不可用，日志链路会失败。
+当前架构下，collector 部署和排障仍依赖本机 `kubectl`，但日志查询路径由 host proxy 通过 gateway 实例元数据路由到对应 node collector。
 
 ### runtime 相关日志正常但 handler 输出不明显
 
@@ -409,6 +409,5 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./start.sh
 - k8s 模式当前仍依赖：
   - `kubectl`
   - `minikube`
-  - `kubectl port-forward`
-  - `kubectl exec`
+  - 本地 MinIO port-forward 等开发环境辅助进程
 - collector 的部署依赖本机临时文件 `/tmp/faas-logdaemon.yaml` 与 `/tmp/faas-bin`。

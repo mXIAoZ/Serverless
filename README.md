@@ -313,11 +313,10 @@ Scheduler 管理函数注册表和容器池：
 
 Scheduler 通过 `RuntimeBackend` 抽象创建和停止函数实例，目前支持两种后端：
 
-- `FAAS_BACKEND=docker`：默认后端，使用 `docker run` 和端口映射启动本地容器。
-- `FAAS_BACKEND=k8s`：Kubernetes 后端，面向 minikube，用 `kubectl` 创建 Pod，并用本地 `kubectl port-forward` 让 gateway 访问 Pod 内 runtime-agent。
+- `FAAS_BACKEND=docker`：默认后端，通过 Docker Engine HTTP API 创建本地容器，并映射到宿主机端口。
+- `FAAS_BACKEND=k8s`：Kubernetes 后端，面向 minikube，通过 client-go 创建 Pod，并用 SPDY port-forward 让 gateway 访问 Pod 内 runtime-agent。
 
-Kubernetes 后端会把上传到 `/tmp/faas/{name}` 的函数代码同步到 minikube VM，再用 `hostPath` 挂载到 Pod 的 `/function`。
-Scheduler 还会记录实例所在 `nodeName`，供 logdaemon proxy 按函数实例路由到对应 node collector。
+上传代码会先解压到本地 `/tmp/faas/{name}`。当配置 MinIO 时，scheduler 还会保存 zip 对象并记录 `CodeKey`/`CodeURL`；Kubernetes 后端优先用 initContainer 从 presigned URL 下载代码并解压到 `/function`，只有没有对象存储信息时才回退到旧的 minikube hostPath 同步路径。Scheduler 还会记录实例所在 `nodeName`，供 logdaemon proxy 按函数实例路由到对应 node collector。
 
 ### Runtime API Server
 
@@ -422,7 +421,7 @@ cd /Users/z/serverless
 FAAS_BACKEND=k8s ./start.sh
 ```
 
-Kubernetes 后端会执行 `minikube image load faas-runtime:latest`，函数 Pod 通过 `kubectl port-forward` 暴露到本地 `9100+` 端口，因此 gateway 仍可在宿主机上运行。
+Kubernetes 后端会执行 `minikube image load faas-runtime:latest`。函数 Pod 由 client-go 创建，gateway 通过 SPDY port-forward 连接 Pod 内 runtime-agent，因此 gateway 仍可在宿主机上运行。
 
 在 `FAAS_BACKEND=k8s` 下，`start.sh` 还会：
 
@@ -522,13 +521,13 @@ curl 'http://localhost:9200/logs/hello?tail=10'
 
 ## 当前已知限制
 
-- Kubernetes 后端当前面向 minikube，本地 gateway 通过 `kubectl port-forward` 访问 Pod，不是生产 datapath。
-- 函数元数据只在内存中，gateway 重启后丢失。
-- 上传的代码放在 `/tmp/faas/{name}`，没有版本管理和制品存储。
+- Kubernetes 后端当前面向 minikube，本地 gateway 通过 Pod port-forward 访问 runtime-agent，不是生产 datapath。
+- 未设置 `MONGO_URI` 时函数元数据只在内存中；设置 Mongo 后函数配置可持久化，但运行中的容器/Pod 仍是运行时状态。
+- 上传代码会落到本地 `/tmp/faas/{name}`；配置 MinIO 后会同时保存 zip 对象并用 `CodeKey`/`CodeURL` 支持 Kubernetes 代码分发，但还没有函数版本、alias 和 rollback。
 - scheduler 冷启动没有全局并发保护，主要靠 gateway queue 减少入口压力。
 - scalersvc 当前指标聚合仍偏简化，容器指标与函数映射还可以更严格。
 - 没有鉴权、租户隔离、配额和审计。
-- Kubernetes 日志链路目前依赖 host `logdaemon` 通过 `kubectl exec` 进入 collector 查询，本地学习环境可用，但还不是高效的数据面。
+- Kubernetes 日志链路使用 DaemonSet collector 和 host proxy；proxy 依赖 gateway 实例元数据按 node 路由，仍是学习环境形态而非生产级日志数据面。
 - Runtime API 只实现了最小调用闭环。
 - Python bootstrap 只支持同步 handler，没有依赖安装和多语言 runtime 管理。
 
@@ -556,12 +555,11 @@ curl 'http://localhost:9200/logs/hello?tail=10'
 
 ### 3. 持久化控制面
 
-当前函数注册表、容器池和扩缩容状态主要在内存里。后续可以加入：
+当前无 `MONGO_URI` 时仍以内存状态运行；配置 Mongo 后，函数元数据和 scaler 最新状态可以持久化，MinIO 可保存上传代码包。后续可以继续加入：
 
-- SQLite / Postgres 存函数元数据。
-- 本地对象存储或 MinIO 存函数代码包。
+- SQLite / Postgres 作为轻量控制面存储选项。
 - 函数版本、alias、rollback。
-- gateway 重启后恢复函数列表和运行状态。
+- gateway 重启后更完整地协调已存在的运行中容器/Pod。
 
 ### 4. 多节点调度
 
@@ -619,8 +617,8 @@ curl 'http://localhost:9200/logs/hello?tail=10'
 建议按下面顺序继续做：
 
 1. 稳定 queue 与 p99 驱动的 autoscaling 时序，补掉当前测试里的竞态。
-2. 把 Kubernetes log proxy 从 `kubectl exec` 升级为真正的 collector 直连或 Service/EndpointSlice 路由。
-3. 加 SQLite 持久化函数元数据和代码版本。
+2. 把 Kubernetes log proxy 升级为真正的 collector 直连或 Service/EndpointSlice 路由。
+3. 加函数代码版本、alias 和 rollback。
 4. 增加 Prometheus metrics，统一暴露 gateway、agent、scaler 指标。
 5. 实现 Node.js runtime，验证 Runtime API 抽象是否足够通用。
-6. 把 Kubernetes 后端从 `kubectl` shell out 升级为 client-go，并用 Service/EndpointSlice 替代本地 port-forward。
+6. 用 Service/EndpointSlice 替代本地 Pod port-forward，形成更接近生产的数据面。

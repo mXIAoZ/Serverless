@@ -39,7 +39,7 @@ const (
 	stateStarting                       // 冷启动中
 )
 
-// container 代表一个沙箱容器实例
+// container represents a managed function runtime instance.
 type container struct {
 	id       string
 	addr     string // host:port，指向容器内 /invoke
@@ -153,7 +153,7 @@ func (s *Scheduler) Deregister(name string) {
 	}
 }
 
-// UploadCode 将 zip 内容解压到 /tmp/faas/{name}/，并更新函数配置
+// UploadCode stores uploaded zip bytes, extracts local code, and updates function metadata.
 func (s *Scheduler) UploadCode(name string, zipData []byte) error {
 	s.mu.Lock()
 	cfg, ok := s.functions[name]

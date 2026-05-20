@@ -43,7 +43,7 @@ func (r *Router) Invoke(w http.ResponseWriter, req *http.Request, name string) {
 	c, err := r.sched.Acquire(name)
 	if err != nil {
 		log.Printf("[router] acquire failed for %q: %v", name, err)
-		http.Error(w, "failed to acquire sandbox", http.StatusServiceUnavailable)
+		http.Error(w, "failed to acquire function instance", http.StatusServiceUnavailable)
 		return
 	}
 	defer r.sched.Release(c)
@@ -52,10 +52,10 @@ func (r *Router) Invoke(w http.ResponseWriter, req *http.Request, name string) {
 	ctx, cancel := context.WithTimeout(req.Context(), timeout)
 	defer cancel()
 
-	sandboxURL := fmt.Sprintf("http://%s/invoke", c.Addr())
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, sandboxURL, bytes.NewReader(body))
+	instanceURL := fmt.Sprintf("http://%s/invoke", c.Addr())
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, instanceURL, bytes.NewReader(body))
 	if err != nil {
-		http.Error(w, "failed to build sandbox request", http.StatusInternalServerError)
+		http.Error(w, "failed to build function request", http.StatusInternalServerError)
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -64,15 +64,15 @@ func (r *Router) Invoke(w http.ResponseWriter, req *http.Request, name string) {
 	client := &http.Client{}
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Printf("[router] sandbox invoke error for %q: %v", name, err)
-		http.Error(w, "sandbox unavailable", http.StatusBadGateway)
+		log.Printf("[router] function invoke error for %q: %v", name, err)
+		http.Error(w, "function instance unavailable", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	var result InvokeResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		http.Error(w, "invalid sandbox response", http.StatusBadGateway)
+		http.Error(w, "invalid function response", http.StatusBadGateway)
 		return
 	}
 

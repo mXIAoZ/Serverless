@@ -113,7 +113,7 @@
 
 阅读目标：
 
-- 函数注册信息如何保存在内存里
+- 函数注册信息如何保存在内存里，以及配置 Mongo 时如何持久化
 - 上传代码如何替换旧实例
 - 实例池怎么组织
 - idle / busy 状态如何流转
@@ -152,7 +152,7 @@
 
 重点看：
 
-- `docker run`
+- Docker Engine API 创建容器
 - 端口映射到 `9001`
 - `FUNCTION_HANDLER`
 - `GATEWAY_ADDR`
@@ -170,18 +170,18 @@
 
 重点看：
 
-- `syncCodeToMinikube()`
-- `podManifest()`
-- `kubectl apply`
-- `kubectl wait`
-- `kubectl port-forward`
+- MinIO presigned URL + initContainer 代码分发
+- hostPath fallback
+- Pod manifest 构造
+- client-go 创建/等待 Pod
+- SPDY port-forward
 - `podNodeName()`
 
 你应该意识到：
 
 - gateway 仍运行在宿主机
 - 函数 Pod 在 minikube
-- 两边靠 `port-forward` 和 `hostPath` 接起来
+- 两边靠 Pod port-forward 接起来，代码优先走 MinIO/initContainer，缺少对象存储时才回退 hostPath
 
 ## 第 7 步：看容器内部运行时，理解用户代码怎么真正执行
 

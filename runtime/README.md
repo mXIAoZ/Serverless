@@ -5,7 +5,7 @@
 - `runtime-server`：实现最小版 Lambda Runtime API。
 - `runtime-agent`：作为容器入口，代理调用、暴露健康检查与指标。
 
-此外，这个目录还包含 Python bootstrap 和示例 handler。
+此外，这个目录还包含 Python bootstrap、Go bootstrap，以及 Python/Go 示例 handler。
 
 ## 目录结构
 
@@ -14,13 +14,17 @@ runtime/
 ├── cmd/
 │   ├── runtime/
 │   │   └── main.go
-│   └── agent/
+│   ├── agent/
+│   │   └── main.go
+│   └── go-bootstrap/
 │       └── main.go
 ├── bootstrap/
 │   └── python3_bootstrap.py
 ├── examples/
-│   └── python/
-│       └── handler.py
+│   ├── python/
+│   │   └── handler.py
+│   └── go/
+│       └── main.go
 └── entrypoint.sh
 ```
 
@@ -47,13 +51,14 @@ runtime/
 - 统计调用数、成功数、错误数、延迟分位数。
 - 周期性把指标上报给 gateway。
 
-### `bootstrap/python3_bootstrap.py`
+### 语言 bootstrap
 
 职责：
 
-- 动态加载用户 `handler`。
+- Python runtime 使用 `bootstrap/python3_bootstrap.py` 动态加载用户 `handler`。
+- Go runtime 使用 `cmd/go-bootstrap` 执行用户提供的 `/function/bootstrap` 二进制。
 - 轮询 Runtime API 获取事件。
-- 调用 handler。
+- 调用用户 handler 或 bootstrap 进程。
 - 把结果或异常回传给 runtime-server。
 
 ## 进程关系
@@ -69,14 +74,14 @@ exec /usr/local/bin/runtime-agent
 
 1. `runtime-server` 先在后台启动。
 2. `runtime-agent` 作为前台主进程启动。
-3. `runtime-server` 再自己拉起 Python bootstrap 子进程。
+3. `runtime-server` 根据 `FUNCTION_RUNTIME` 拉起 Python bootstrap 或 Go bootstrap 子进程。
 
 最终在一个函数容器内，至少有三层角色：
 
 - `runtime-agent`
 - `runtime-server`
-- `python3_bootstrap.py`
-- 用户 `handler.py`
+- 语言 bootstrap（`python3_bootstrap.py` 或 `go-bootstrap`）
+- 用户代码（Python handler 或 Go `/function/bootstrap`）
 
 ## runtime-server 详细说明
 
@@ -155,7 +160,7 @@ bootstrap 调用 `/runtime/invocation/{id}/response` 或 `/error` 时：
   - `FUNCTION_HANDLER`
   - `FUNCTION_RUNTIME`
   - `FUNCTION_DIR`
-- 推导 bootstrap 路径，如 `/runtime/bootstrap/python3_bootstrap.py`。
+- 根据 `FUNCTION_RUNTIME` 选择 bootstrap：Python 使用 `/runtime/bootstrap/{runtime}_bootstrap.py`，Go 使用 `/runtime/bootstrap/go-bootstrap`。
 - 启动 bootstrap 子进程。
 - 子进程退出后等待 1 秒并自动重启。
 
@@ -246,11 +251,11 @@ bootstrap 调用 `/runtime/invocation/{id}/response` 或 `/error` 时：
 - 否则尝试从 `/proc/self/cgroup` 猜。
 - 再不行就退化成 hostname。
 
-## Python bootstrap 详细说明
+## 语言 bootstrap 详细说明
 
-实现位于 `runtime/bootstrap/python3_bootstrap.py`。
+Python 实现位于 `runtime/bootstrap/python3_bootstrap.py`，Go adapter 实现位于 `runtime/cmd/go-bootstrap/main.go`。
 
-### 启动阶段
+### Python 启动阶段
 
 1. 读环境变量：
    - `RUNTIME_API`
@@ -258,6 +263,12 @@ bootstrap 调用 `/runtime/invocation/{id}/response` 或 `/error` 时：
    - `FUNCTION_DIR`
 2. 把 `/function` 加入 `sys.path`。
 3. 通过 `importlib.import_module()` 动态导入 handler。
+
+### Go 启动阶段
+
+1. 读 `FUNCTION_DIR`，默认 `/function`。
+2. 执行用户上传包里的 `/function/bootstrap`。
+3. 把 Runtime API 事件 JSON 写入子进程 stdin，并要求 stdout 返回 JSON。
 
 ### 主循环
 
@@ -281,11 +292,12 @@ bootstrap 的 `main()` 是个无限循环：
 
 ## 示例函数
 
-`runtime/examples/python/handler.py` 是默认测试用函数。
+`runtime/examples/python/handler.py` 是默认 Python 测试函数，`runtime/examples/go/main.go` 展示 Go 函数如何编译成 `/function/bootstrap`。
 
-它主要说明两件事：
+示例主要说明两件事：
 
-- handler 需要是 `handler(event, context)` 形式。
+- Python handler 需要是 `handler(event, context)` 形式。
+- Go 函数需要提供可执行 `bootstrap`，从 stdin 读取 JSON 并向 stdout 输出 JSON。
 - 用户代码可以从 event 里读业务参数，也能利用 `sleep_ms` 模拟慢调用，帮助测试 queue 与 autoscaling。
 
 ## 关键环境变量
@@ -318,14 +330,16 @@ bootstrap 的 `main()` 是个无限循环：
 3. `runtime/cmd/runtime/main.go`
    - 看 Runtime API 和调用队列。
 4. `runtime/bootstrap/python3_bootstrap.py`
-   - 看语言层如何接入 Runtime API。
-5. `runtime/examples/python/handler.py`
+   - 看 Python 语言层如何接入 Runtime API。
+5. `runtime/cmd/go-bootstrap/main.go`
+   - 看 Go adapter 如何执行用户 bootstrap。
+6. `runtime/examples/python/handler.py` 与 `runtime/examples/go/main.go`
    - 看用户代码最小形态。
 
 ## 当前限制
 
 - `runtime-server` 的调用队列只在内存里。
 - timeout 逻辑仍比较粗，只是 gateway -> agent -> runtime 这一段的整体超时。
-- bootstrap 只支持 Python，且只有同步 handler。
+- Python bootstrap 只有同步 handler；Go runtime 依赖用户提供可执行 `bootstrap` 并遵守 stdin/stdout JSON 协议。
 - 没有 dependency install、layer、init hook、streaming response 等能力。
 - `startFunction()` 崩溃自动重启是无上限重试，适合学习，不适合生产直接照搬。

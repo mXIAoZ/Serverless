@@ -320,25 +320,17 @@ collector 运行在每个 k8s node 上，只负责采集“本 node 上的函数
 
 ### `collectorsByNode()`
 
-通过：
-
-- `kubectl get pods -n {namespace} -l app=faas-log-collector -o json`
-
-建立：
+通过 in-cluster Kubernetes API 发现 collector Pod，并建立：
 
 - `nodeName -> collectorPod`
 
 ### `fetchCollectorLogs()`
 
-这是当前实现最特殊的一段。
+这是 proxy 聚合 collector 日志的路径。
 
-理论上的目标是 proxy 直连 collector HTTP，但在当前 minikube 学习环境下，宿主机到 collector 的节点网络路径并不稳定，所以现在的做法是：
+host proxy 先通过 gateway 的实例元数据判断函数实例所在 node，再把请求路由到对应 node collector。collector 在集群内使用 Kubernetes API 读取 Pod 日志，并通过本地 HTTP 接口返回 ring buffer 中的结果。
 
-- `kubectl exec` 进入 collector Pod
-- 在 Pod 内部请求 `http://127.0.0.1:9200/local/logs/{func}`
-- 把 JSON 输出拿回宿主机
-
-也就是说：当前已经是“collector + proxy”架构，但 proxy 到 collector 的 hop 仍然借助了 `kubectl exec`。
+也就是说：当前已经是“collector + proxy”架构，但仍是面向本地学习环境的简化日志数据面。
 
 ### `fetchLogs()`
 
@@ -384,7 +376,7 @@ collector 运行在每个 k8s node 上，只负责采集“本 node 上的函数
 
 ## 当前限制
 
-- k8s proxy 到 collector 目前仍依赖 `kubectl exec`，不是真正的高效直连数据面。
+- k8s proxy 到 collector 的路径仍是本地学习环境实现，不是真正的高效生产日志数据面。
 - collector 是 polling attach 模型，不是 watch/cache。
 - collector 当前把 Pod log 统一记成 `stdout`，没有保留 stdout/stderr 原始区分。
 - `/local/logs/*` 和 `/logs/*` 都是内存 ring buffer 优先，没有完整持久化与重放语义。
