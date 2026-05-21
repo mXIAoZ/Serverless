@@ -296,8 +296,8 @@
 这是日志系统最核心的公共层：
 
 - ring buffer
-- `/logs/*`
-- `/local/logs/*`
+- gateway 的 `/logs/*` 用户入口
+- logdaemon 内部的 `/logs/*` 与 `/local/logs/*`
 - proxy 查询
 - SSE stream
 

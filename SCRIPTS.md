@@ -157,7 +157,7 @@ Kubernetes 模式：
 
 - `http://localhost:8080/health`
 - `http://localhost:9300/health`
-- `http://localhost:9200/health`
+- `http://localhost:9200/health`（内部 logdaemon readiness）
 
 全部成功后才打印服务地址。
 
@@ -213,7 +213,7 @@ Kubernetes 模式：
 - scheduler 冷启动和热复用
 - runtime-agent 指标上报
 - scalersvc 的 p99 / queue 扩缩容判断
-- logdaemon 日志查询
+- gateway 日志查询入口与内部 logdaemon 采集链路
 
 ### 核心环境变量
 
@@ -221,7 +221,7 @@ Kubernetes 模式：
 - `K8S_NAMESPACE`
 - `GATEWAY` 默认 `http://localhost:8080`
 - `SCALER` 默认 `http://localhost:9300`
-- `LOGS` 默认 `http://localhost:9200`
+- `LOGS` 默认跟随 gateway：`http://localhost:8080`
 - `FUNC` 默认 `hello`
 - `QUEUE_FUNC` 默认 `hello-queue`
 
@@ -298,13 +298,13 @@ Kubernetes 模式：
 
 ##### Docker 模式
 
-直接调用：
+通过 gateway 调用：
 
 - `GET /logs/{func}`
 
 ##### Kubernetes 模式
 
-- 测试会轮询 `GET /logs/{func}?tail=10`
+- 测试会轮询 gateway 的 `GET /logs/{func}?tail=10`
 - 断言至少能看到 runtime/invoke/bootstrap 相关日志
 
 这里现在不再死盯 `Hello, Alice!`，因为当前可见日志更多是函数 Pod stdout 的完整输出，而不一定总是恰好包含 handler 的返回内容。
@@ -390,9 +390,9 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./start.sh
 
 - collector DaemonSet 是否 ready
 - `kubectl logs -n <ns> -l app=faas-log-collector`
-- `curl 'http://localhost:9200/logs/hello?tail=20'`
+- `curl 'http://localhost:8080/logs/hello?tail=20'`
 
-当前架构下，collector 部署和排障仍依赖本机 `kubectl`，但日志查询路径由 host proxy 通过 gateway 实例元数据路由到对应 node collector。
+当前架构下，collector 部署和排障仍依赖本机 `kubectl`。日志查询路径由 host proxy 通过 gateway 实例元数据定位 node collector，但 proxy 到 collector 仍通过 Kubernetes exec API 进入 collector Pod；如果集群 RBAC 不允许 `pods/exec`，日志链路会失败。
 
 ### runtime 相关日志正常但 handler 输出不明显
 
@@ -409,5 +409,6 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./start.sh
 - k8s 模式当前仍依赖：
   - `kubectl`
   - `minikube`
+  - Kubernetes `pods/exec` 权限用于 logdaemon proxy 查询 collector
   - 本地 MinIO port-forward 等开发环境辅助进程
 - collector 的部署依赖本机临时文件 `/tmp/faas-logdaemon.yaml` 与 `/tmp/faas-bin`。

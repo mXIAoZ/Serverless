@@ -160,7 +160,7 @@ bootstrap 调用 `/runtime/invocation/{id}/response` 或 `/error` 时：
   - `FUNCTION_HANDLER`
   - `FUNCTION_RUNTIME`
   - `FUNCTION_DIR`
-- 根据 `FUNCTION_RUNTIME` 选择 bootstrap：Python 使用 `/runtime/bootstrap/{runtime}_bootstrap.py`，Go 使用 `/runtime/bootstrap/go-bootstrap`。
+- 根据 `FUNCTION_RUNTIME` 选择 bootstrap：当前支持 `python3 -> /runtime/bootstrap/python3_bootstrap.py`，`go -> /runtime/bootstrap/go-bootstrap`。
 - 启动 bootstrap 子进程。
 - 子进程退出后等待 1 秒并自动重启。
 

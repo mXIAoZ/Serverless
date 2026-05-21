@@ -5,7 +5,8 @@ cd "$(dirname "$0")"
 
 GATEWAY="http://localhost:8080"
 SCALER="http://localhost:9300"
-LOGS="http://localhost:9200"
+LOGDAEMON_INTERNAL="http://localhost:9200"
+LOGS="$GATEWAY"
 FUNC="hello"
 QUEUE_FUNC="hello-queue"
 GO_FUNC="hello-go"
@@ -23,7 +24,7 @@ json_field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get(
 sep "health checks"
 curl -sf $GATEWAY/health >/dev/null && ok "gateway"
 curl -sf $SCALER/health  >/dev/null && ok "scalersvc"
-curl -sf $LOGS/health    >/dev/null && ok "logdaemon"
+curl -sf $LOGDAEMON_INTERNAL/health >/dev/null && ok "internal logdaemon"
 
 # ── 2. 注册函数 ──────────────────────────────────────────────────
 sep "register function"
@@ -242,14 +243,14 @@ assert any('[runtime-api]' in e.get('line', '') or '[bootstrap]' in e.get('line'
     fi
     sleep 1
   done
-  [ "$LOG_OK" -eq 1 ] || fail "expected k8s collector/proxy logs for $FUNC"
+  [ "$LOG_OK" -eq 1 ] || fail "expected gateway log API through collector/proxy for $FUNC"
   echo "$RESP" | python3 -c "
 import sys, json
 for e in json.load(sys.stdin):
     ts = e['time'][:19].replace('T',' ')
     print(f'  [{ts}] [{e[\"stream\"]}] {e[\"line\"]}')
 "
-  ok "k8s collector/proxy logs visible"
+  ok "gateway log API through collector/proxy visible"
 else
   RESP=$(curl -s "$LOGS/logs/$FUNC?tail=10" || true)
   if [ -z "$RESP" ]; then

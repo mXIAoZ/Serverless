@@ -12,7 +12,7 @@
 - scheduler 如何复用实例、触发冷启动、管理双后端
 - runtime-agent 和 runtime-server 如何把平台请求交给用户 handler
 - scalersvc 如何根据 queue / p99 / error rate 做扩缩容判断
-- logdaemon 如何在 Docker 和 Kubernetes 下提供统一日志查询接口
+- gateway 如何统一承载函数管理、调用和日志查询入口
 
 如果你把它当成“一个可读、可跑、可逐步扩展的 serverless 平台骨架”会比较合适。
 
@@ -50,7 +50,7 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./stop.sh
 - 容器内实现 Lambda 风格 Runtime API。
 - Python handler 动态加载和执行。
 - runtime-agent 负责请求转发、健康检查、指标采集和周期上报。
-- logdaemon 提供 Docker 日志采集，Kubernetes 下采用 node-local collector + host proxy 查询接口。
+- gateway 提供统一日志查询入口，logdaemon 在内部负责 Docker 日志采集，Kubernetes 下采用 node-local collector + host proxy 查询链路。
 - scalersvc 独立运行，收集 agent 指标并按默认策略扩缩容。
 - gateway 内置 per-function 请求队列和背压。
 - 本地一键启动、停止和端到端测试脚本。
@@ -119,152 +119,32 @@ serverless/
 
 ## 当前架构图
 
-```mermaid
-flowchart LR
-    Client[Client / curl] --> Gateway[Gateway :8080]
-
-    subgraph GatewayProcess[Gateway Process]
-        Gateway --> Queue[Per-function Queue / Backpressure]
-        Queue --> Router[Router]
-        Router --> Scheduler[Scheduler / Container Pool]
-        Gateway --> InternalAPI[Internal APIs for Scaler and Log Proxy]
-    end
-
-    Scheduler --> Backend[RuntimeBackend]
-    Backend --> Docker[Docker Engine]
-    Backend --> K8s[Kubernetes / minikube]
-    Docker --> Container[Function Container]
-    K8s --> Container
-
-    subgraph Container[Function Container]
-        Agent[Runtime Agent :9001]
-        Runtime[Runtime API Server :9000]
-        Bootstrap[Python Bootstrap]
-        Handler[User Handler]
-        Agent --> Runtime
-        Runtime --> Bootstrap
-        Bootstrap --> Handler
-    end
-
-    Router --> Agent
-    Agent -- metrics every 10s --> Gateway
-    Gateway -- forward metrics --> ScalerSvc[ScalerSvc :9300]
-    ScalerSvc --> InternalAPI
-    InternalAPI --> Scheduler
-
-    Docker -- events/logs --> LogDaemon[LogDaemon :9200]
-    K8s --> LogProxy[LogDaemon proxy :9200]
-    LogProxy --> InternalAPI
-    K8s --> CollectorDS[DaemonSet collectors]
-    CollectorDS --> LogProxy
-```
+![当前架构图](docs/diagrams/system-architecture.svg)
 
 ## 请求调用链路
 
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant G as Gateway
-    participant Q as Queue
-    participant R as Router
-    participant S as Scheduler
-    participant A as Runtime Agent
-    participant RT as Runtime API
-    participant B as Python Bootstrap
-    participant H as Handler
-
-    C->>G: POST /invoke/{name}
-    G->>Q: acquire per-function slot
-    alt queue full
-        Q-->>C: 429 queue full
-    else queue timeout
-        Q-->>C: 503 queue timeout
-    else slot acquired
-        Q->>R: Invoke
-        R->>S: Acquire container
-        alt no idle instance
-            S->>S: backend cold start Docker container or Kubernetes Pod
-        end
-        S-->>R: runtime instance addr
-        R->>A: POST /invoke
-        A->>RT: proxy /invoke
-        RT->>B: dispatch via /runtime/invocation/next
-        B->>H: call handler(event, context)
-        H-->>B: result
-        B->>RT: POST /runtime/invocation/{id}/response
-        RT-->>A: invoke result
-        A-->>R: response + metrics recorded
-        R->>S: Release container
-        R-->>Q: done
-        Q-->>C: handler response
-    end
-```
+![请求调用链路](docs/diagrams/invocation-sequence.svg)
 
 ## 指标与扩缩容链路
 
-```mermaid
-sequenceDiagram
-    participant A as Runtime Agent
-    participant G as Gateway
-    participant SC as ScalerSvc
-    participant GI as Gateway Internal API
-    participant S as Scheduler
-
-    A->>G: POST /containers/{id}/metrics
-    G->>SC: POST /metrics/{id}
-    loop every 5s
-        SC->>GI: GET /internal/functions
-        SC->>GI: GET /internal/stats/{funcName}
-        SC->>SC: evaluate util / p99 / error rate
-        alt scale up
-            SC->>GI: POST /internal/scale-up/{funcName}
-            GI->>S: ColdStartOne(funcName)
-        else scale down
-            SC->>GI: POST /internal/scale-down/{funcName}
-            GI->>S: RemoveIdle(funcName)
-        else none
-            SC->>SC: record decision
-        end
-    end
-```
+![指标与扩缩容链路](docs/diagrams/metrics-scaling.svg)
 
 ## 日志采集链路
 
-```mermaid
-flowchart LR
-    Client[Client] --> LogAPI[GET /logs/{funcName}]
-
-    subgraph DockerBackend[FAAS_BACKEND=docker]
-        Docker[Docker Engine] --> Events[Docker Events]
-        Docker --> Logs[Container stdout/stderr]
-        Events --> DockerDaemon[logdaemon docker mode]
-        Logs --> DockerDaemon
-        DockerDaemon --> DockerBuffer[Per-function Ring Buffer]
-        DockerDaemon --> DockerFiles[/tmp/faas-logs/*.log]
-        LogAPI --> DockerBuffer
-    end
-
-    subgraph K8sBackend[FAAS_BACKEND=k8s]
-        LogAPI --> Proxy[logdaemon proxy mode]
-        Proxy --> GatewayInternal[/internal/instances/{funcName}]
-        Proxy --> Collector[logdaemon collector mode]
-        Collector --> K8sAPI[Kubernetes Pod + PodLog API]
-        Collector --> CollectorBuffer[Node-local ring buffer]
-        CollectorBuffer --> Proxy
-    end
-```
+![日志采集链路](docs/diagrams/logging-path.svg)
 
 ## 核心组件说明
 
 ### Gateway
 
-Gateway 是系统入口，监听 `:8080`，负责对外暴露函数管理和调用接口：
+Gateway 是系统唯一用户入口，监听 `:8080`，负责对外暴露函数管理、调用和日志查询接口：
 
 - `POST /functions/{name}`：注册函数。
 - `DELETE /functions/{name}`：注销函数并停止相关容器。
 - `PUT /functions/{name}/code`：上传 zip 代码包。
 - `POST /invoke/{name}`：调用函数。
 - `GET /queues/{name}`：查看函数请求队列状态。
+- `GET /logs/{funcName}`：用户查询函数日志，gateway 同步代理到内部 logdaemon。
 - `POST /containers/{id}/metrics`：接收 runtime-agent 指标并转发给 scalersvc。
 - `/internal/*`：给 scalersvc 调用的内部控制接口。
 
@@ -372,7 +252,7 @@ scalersvc 独立运行，监听 `:9300`，通过 HTTP REST 与 gateway 通信：
 
 ### LogDaemon
 
-logdaemon 统一监听 `:9200`，但按后端分两种实现：
+logdaemon 是内部日志采集服务，监听 `:9200` 供 gateway 调用；用户通过 gateway 的 `GET /logs/{funcName}` 查询日志。它按后端分两种实现：
 
 - `FAAS_BACKEND=docker`：单进程 docker mode，通过 Docker socket 收集日志。
 - `FAAS_BACKEND=k8s`：宿主机运行 proxy mode，Kubernetes 内每个 node 跑一个 collector mode DaemonSet。
@@ -384,14 +264,14 @@ Docker 模式下：
 - 读取 stdout/stderr 日志流。
 - 维护 per-function ring buffer。
 - 写入 `/tmp/faas-logs/{funcName}.log`。
-- 提供 `GET /logs/{funcName}?tail=10` 查询接口。
+- gateway 代理 `GET /logs/{funcName}?tail=10` 到内部 logdaemon。
 
 Kubernetes 模式下：
 
 - collector 通过 ServiceAccount 直连 in-cluster Kubernetes API，不依赖 collector 容器内安装 `kubectl`。
 - collector 只跟随本 node 上、带 `faas.managed-by=local-faas` 的函数 Pod 日志。
 - proxy 通过 gateway `/internal/instances/{funcName}` 获取函数实例和 `nodeName`。
-- proxy 再定位对应 collector，并转发 `/logs/{funcName}` 查询。
+- gateway 把 `/logs/{funcName}` 查询交给内部 proxy，proxy 再定位对应 collector。
 - collector 同样维护 node-local ring buffer，并暴露 `/local/logs/{funcName}` 供 proxy 查询。
 
 ## 本地运行
@@ -428,7 +308,7 @@ Kubernetes 后端会执行 `minikube image load faas-runtime:latest`。函数 Po
 - 交叉编译 Linux 版 `logdaemon` 到 `bin/logdaemon-linux`。
 - 把 collector 二进制同步到 minikube node 的 `/tmp/faas-bin`。
 - 应用 `k8s-logdaemon.yaml`，部署 `faas-log-collector` DaemonSet、ServiceAccount 和 RBAC。
-- 在宿主机启动 `LOGDAEMON_MODE=proxy` 的 logdaemon，对外继续暴露 `http://localhost:9200/logs/{func}`。
+- 在宿主机启动 `LOGDAEMON_MODE=proxy` 的内部 logdaemon，gateway 通过它查询 collector 日志。
 
 `start.sh` 会执行：
 
@@ -491,16 +371,18 @@ curl -X POST http://localhost:8080/invoke/hello \
 curl http://localhost:8080/queues/hello
 ```
 
-### ScalerSvc
+### Internal scaler debug
+
+scalersvc 监听 `:9300`，但它是内部控制面服务。普通用户操作都应通过 gateway；直接访问 scaler 只适合本地调试自动扩缩容：
 
 ```bash
 curl http://localhost:9300/scale/hello
 ```
 
-### LogDaemon
+### Logs
 
 ```bash
-curl 'http://localhost:9200/logs/hello?tail=10'
+curl 'http://localhost:8080/logs/hello?tail=10'
 ```
 
 ## 与主流 FaaS 架构的关系
