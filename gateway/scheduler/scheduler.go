@@ -112,7 +112,7 @@ func (s *Scheduler) Register(cfg FunctionConfig) error {
 	if cfg.Runtime == "" {
 		cfg.Runtime = "python3"
 	}
-	if cfg.Runtime != "python3" && cfg.Runtime != "go" {
+	if !isSupportedRuntime(cfg.Runtime) {
 		return fmt.Errorf("unsupported runtime %q", cfg.Runtime)
 	}
 	if cfg.Memory == 0 {
@@ -136,6 +136,15 @@ func (s *Scheduler) Register(cfg FunctionConfig) error {
 		return fmt.Errorf("save function metadata: %w", err)
 	}
 	return nil
+}
+
+func isSupportedRuntime(runtime string) bool {
+	switch runtime {
+	case "python3", "go", "nodejs", "java":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Scheduler) Deregister(name string) {

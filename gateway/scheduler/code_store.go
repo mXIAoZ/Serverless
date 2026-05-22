@@ -24,8 +24,9 @@ type CodeStore interface {
 }
 
 type minioCodeStore struct {
-	client *minio.Client
-	bucket string
+	client         *minio.Client
+	downloadClient *minio.Client
+	bucket         string
 }
 
 func newMinioCodeStoreFromEnv() (CodeStore, error) {
@@ -38,14 +39,27 @@ func newMinioCodeStoreFromEnv() (CodeStore, error) {
 	bucket := envOrDefault("MINIO_BUCKET", "faas-code")
 	useSSL, _ := strconv.ParseBool(os.Getenv("MINIO_USE_SSL"))
 
+	creds := credentials.NewStaticV4(accessKey, secretKey, "")
 	client, err := minio.New(endpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(accessKey, secretKey, ""),
+		Creds:  creds,
 		Secure: useSSL,
+		Region: "us-east-1",
 	})
 	if err != nil {
 		return nil, err
 	}
-	store := &minioCodeStore{client: client, bucket: bucket}
+	downloadClient := client
+	if podEndpoint := os.Getenv("MINIO_POD_ENDPOINT"); podEndpoint != "" {
+		downloadClient, err = minio.New(podEndpoint, &minio.Options{
+			Creds:  creds,
+			Secure: useSSL,
+			Region: "us-east-1",
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	store := &minioCodeStore{client: client, downloadClient: downloadClient, bucket: bucket}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := store.ensureBucket(ctx, os.Getenv("MINIO_PUBLIC_READ") == "true"); err != nil {
@@ -88,7 +102,7 @@ func (s *minioCodeStore) SaveCode(ctx context.Context, name string, zipData []by
 	if err != nil {
 		return CodeObject{}, err
 	}
-	codeURL, err := s.client.PresignedGetObject(ctx, s.bucket, key, 24*time.Hour, url.Values{})
+	codeURL, err := s.downloadClient.PresignedGetObject(ctx, s.bucket, key, 24*time.Hour, url.Values{})
 	if err != nil {
 		return CodeObject{}, err
 	}

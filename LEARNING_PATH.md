@@ -192,6 +192,9 @@
 - [`runtime/cmd/agent/main.go`](runtime/cmd/agent/main.go)
 - [`runtime/cmd/runtime/main.go`](runtime/cmd/runtime/main.go)
 - [`runtime/bootstrap/python3_bootstrap.py`](runtime/bootstrap/python3_bootstrap.py)
+- [`runtime/cmd/go-bootstrap/main.go`](runtime/cmd/go-bootstrap/main.go)
+- [`runtime/bootstrap/nodejs_bootstrap.js`](runtime/bootstrap/nodejs_bootstrap.js)
+- [`runtime/bootstrap/java/JavaBootstrap.java`](runtime/bootstrap/java/JavaBootstrap.java)
 
 建议阅读顺序不要改，按上面这个顺序最好。
 
@@ -202,6 +205,9 @@
 - `runtime-server`
 - `runtime-agent`
 - Python bootstrap
+- Go bootstrap
+- Node.js bootstrap
+- Java bootstrap
 
 ### 然后看 `runtime-agent`
 
@@ -230,15 +236,21 @@
 - `inflight`
 - `notify`
 
-### 最后看 Python bootstrap
+### 最后看语言 bootstrap
 
 此时你已经知道 Runtime API 长什么样，再回头看 bootstrap，就会很顺：
 
+- Python/Node.js：动态加载用户 handler。
+- Go：执行用户提供的 `/function/bootstrap`。
+- Java：通过 `ClassName::methodName` 反射调用静态方法。
+
+共同主线都是：
+
 - 拉事件
-- 调 handler
+- 调 handler 或用户 bootstrap
 - 回传结果
 
-如果反过来先看 bootstrap，容易只看到一段 Python 轮询，不知道它跟平台整体怎么接上。
+如果反过来先看 bootstrap，容易只看到一段语言进程轮询，不知道它跟平台整体怎么接上。
 
 ## 第 8 步：看 autoscaling，理解系统如何根据压力做反应
 

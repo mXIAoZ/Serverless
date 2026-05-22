@@ -10,6 +10,8 @@ LOGS="$GATEWAY"
 FUNC="hello"
 QUEUE_FUNC="hello-queue"
 GO_FUNC="hello-go"
+NODE_FUNC="hello-node"
+JAVA_FUNC="hello-java"
 BACKEND="${FAAS_BACKEND:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 
@@ -202,7 +204,26 @@ done
 ok "queue backlog triggers scale-up"
 wait $LOAD_PID
 
-# ── 11. Go runtime smoke test ───────────────────────────────────────
+
+# ── 11. Bootstrap unit tests ─────────────────────────────────────────
+sep "bootstrap unit tests"
+if command -v node >/dev/null 2>&1; then
+  node runtime/bootstrap/nodejs_bootstrap_test.js && ok "nodejs bootstrap tests"
+else
+  fail "node is required to run runtime/bootstrap/nodejs_bootstrap_test.js"
+fi
+if ! command -v javac >/dev/null 2>&1; then
+  fail "javac is required to compile runtime/tests/java/JavaBootstrapJsonTest.java"
+fi
+JAVA_BOOTSTRAP_TEST_DIR="/tmp/faas-java-bootstrap-test"
+rm -rf "$JAVA_BOOTSTRAP_TEST_DIR"
+mkdir -p "$JAVA_BOOTSTRAP_TEST_DIR"
+javac --release 21 -d "$JAVA_BOOTSTRAP_TEST_DIR" \
+  runtime/bootstrap/java/JavaBootstrap.java \
+  runtime/tests/java/JavaBootstrapJsonTest.java
+java -cp "$JAVA_BOOTSTRAP_TEST_DIR" JavaBootstrapJsonTest && ok "java bootstrap JSON tests"
+
+# ── 12. Go runtime smoke test ───────────────────────────────────────
 sep "go runtime invoke"
 RESP=$(curl -s -X POST $GATEWAY/functions/$GO_FUNC \
   -H "Content-Type: application/json" \
@@ -225,7 +246,52 @@ echo "  response: $RESP"
 echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['statusCode']==200 and d['message']=='Hello, Gopher!' and d.get('requestId')" \
   && ok "go runtime response"
 
-# ── 12. 查看日志 ──────────────────────────────────────────────────
+# ── 13. Node.js runtime smoke test ───────────────────────────────────
+sep "nodejs runtime invoke"
+RESP=$(curl -s -X POST $GATEWAY/functions/$NODE_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"runtime":"nodejs","handler":"handler.handler"}')
+echo "  $RESP"
+case "$RESP" in
+  *'already registered'*) echo "  (reusing existing function)" ;;
+esac
+zip -j /tmp/$NODE_FUNC.zip runtime/examples/nodejs/handler.js -q
+curl -sf -X PUT $GATEWAY/functions/$NODE_FUNC/code \
+  --data-binary @/tmp/$NODE_FUNC.zip >/dev/null
+RESP=$(curl -sf -X POST $GATEWAY/invoke/$NODE_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Node"}')
+echo "  response: $RESP"
+echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['statusCode']==200 and d['message']=='Hello, Node!' and d.get('requestId')" \
+  && ok "nodejs runtime response"
+
+# ── 14. Java runtime smoke test ──────────────────────────────────────
+sep "java runtime invoke"
+RESP=$(curl -s -X POST $GATEWAY/functions/$JAVA_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"runtime":"java","handler":"Hello::handleRequest"}')
+echo "  $RESP"
+case "$RESP" in
+  *'already registered'*) echo "  (reusing existing function)" ;;
+esac
+if ! command -v javac >/dev/null 2>&1; then
+  fail "javac is required to compile runtime/examples/java/Hello.java for the smoke test"
+fi
+JAVA_BUILD_DIR="/tmp/faas-java-example"
+rm -rf "$JAVA_BUILD_DIR"
+mkdir -p "$JAVA_BUILD_DIR"
+javac --release 21 -d "$JAVA_BUILD_DIR" runtime/examples/java/Hello.java
+zip -j /tmp/$JAVA_FUNC.zip "$JAVA_BUILD_DIR"/*.class -q
+curl -sf -X PUT $GATEWAY/functions/$JAVA_FUNC/code \
+  --data-binary @/tmp/$JAVA_FUNC.zip >/dev/null
+RESP=$(curl -sf -X POST $GATEWAY/invoke/$JAVA_FUNC \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Java"}')
+echo "  response: $RESP"
+echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['statusCode']==200 and d['message']=='Hello, Java!'" \
+  && ok "java runtime response"
+
+# ── 15. 查看日志 ──────────────────────────────────────────────────
 sep "function logs (last 10)"
 if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   LOG_OK=0

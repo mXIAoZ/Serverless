@@ -63,11 +63,13 @@
 - `bin/logdaemon-linux`
 - `bin/runtime-server-linux`
 - `bin/runtime-agent-linux`
+- `bin/go-bootstrap-linux`
 
 这里有两个关键点：
 
 - `logdaemon-linux` 是为了放进 minikube node 给 collector 用。
 - runtime 二进制是交叉编译成 Linux arm64，供容器/节点环境运行。
+- Java bootstrap 在 Dockerfile 的 builder stage 中用 JDK 编译成 `/runtime/bootstrap/java-bootstrap.jar`。
 
 #### 2. 构建 runtime 镜像
 
@@ -213,6 +215,7 @@ Kubernetes 模式：
 - scheduler 冷启动和热复用
 - runtime-agent 指标上报
 - scalersvc 的 p99 / queue 扩缩容判断
+- Node.js bootstrap 单测、Java bootstrap JSON 单测，以及 Python、Go、Node.js、Java runtime 的示例函数 smoke test
 - gateway 日志查询入口与内部 logdaemon 采集链路
 
 ### 核心环境变量
@@ -224,6 +227,11 @@ Kubernetes 模式：
 - `LOGS` 默认跟随 gateway：`http://localhost:8080`
 - `FUNC` 默认 `hello`
 - `QUEUE_FUNC` 默认 `hello-queue`
+- `GO_FUNC` 默认 `hello-go`
+- `NODE_FUNC` 默认 `hello-node`
+- `JAVA_FUNC` 默认 `hello-java`
+- 本机 `javac`
+  - `test.sh` 编译 Java 示例函数时需要；脚本使用 `javac --release 21`，确保本机较新 JDK 编译出的 class 能被 runtime 镜像内固定安装的 Java 21 JRE 加载。
 
 ### 测试阶段
 
@@ -294,7 +302,26 @@ Kubernetes 模式：
   - `action=scale-up`
   - `reason` 含 `queue=`
 
-#### 11. 日志查询
+#### 11. Go runtime smoke test
+
+- 注册 `hello-go`，`runtime=go`。
+- 把 `runtime/examples/go` 编译成 Linux arm64 `/function/bootstrap`。
+- 上传 zip 后调用并断言 `Hello, Gopher!`。
+
+#### 12. Node.js runtime smoke test
+
+- 注册 `hello-node`，`runtime=nodejs`，`handler=handler.handler`。
+- 上传 `runtime/examples/nodejs/handler.js`。
+- 调用并断言 `Hello, Node!` 和 request id。
+
+#### 13. Java runtime smoke test
+
+- 注册 `hello-java`，`runtime=java`，`handler=Hello::handleRequest`。
+- 先用本机 `javac --release 21` 编译 `runtime/bootstrap/java/JavaBootstrap.java` 和 `runtime/tests/java/JavaBootstrapJsonTest.java`，运行 Java bootstrap JSON 单测。
+- 再用本机 `javac --release 21` 编译默认包、单 class 的 `runtime/examples/java/Hello.java` 并上传 `.class`。
+- 调用并断言 `Hello, Java!`。
+
+#### 14. 日志查询
 
 ##### Docker 模式
 

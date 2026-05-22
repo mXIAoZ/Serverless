@@ -10,6 +10,38 @@ import (
 	"time"
 )
 
+func TestRegisterDefaultsRuntime(t *testing.T) {
+	s := testScheduler()
+	if err := s.Register(FunctionConfig{Name: "default-runtime"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, ok := s.Get("default-runtime")
+	if !ok {
+		t.Fatal("function missing after register")
+	}
+	if cfg.Runtime != "python3" {
+		t.Fatalf("Runtime = %q, want python3", cfg.Runtime)
+	}
+}
+
+func TestRegisterAcceptsSupportedRuntimes(t *testing.T) {
+	for _, runtime := range []string{"python3", "go", "nodejs", "java"} {
+		t.Run(runtime, func(t *testing.T) {
+			s := testScheduler()
+			if err := s.Register(FunctionConfig{Name: "fn-" + runtime, Runtime: runtime}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRegisterRejectsUnsupportedRuntime(t *testing.T) {
+	s := testScheduler()
+	if err := s.Register(FunctionConfig{Name: "bad-runtime", Runtime: "ruby"}); err == nil {
+		t.Fatal("expected unsupported runtime to fail")
+	}
+}
+
 func TestExtractZipRejectsEscapedPath(t *testing.T) {
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
@@ -141,6 +173,14 @@ func zipWithFiles(t *testing.T, files map[string]string) []byte {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
+}
+
+func testScheduler() *Scheduler {
+	return &Scheduler{
+		functions: make(map[string]FunctionConfig),
+		pool:      make(map[string][]*container),
+		store:     newMemoryFunctionStore(),
+	}
 }
 
 type fakeCodeStore struct {

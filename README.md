@@ -48,7 +48,7 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./stop.sh
 - 函数注册、注销、代码 zip 上传。
 - Docker 或 Kubernetes Pod 作为函数运行沙箱。
 - 容器内实现 Lambda 风格 Runtime API。
-- Python handler 动态加载和执行。
+- Python、Go、Node.js、Java 四种 runtime：Python/Node.js 动态加载 handler，Go 执行 `/function/bootstrap`，Java 通过 `ClassName::methodName` 反射调用。
 - runtime-agent 负责请求转发、健康检查、指标采集和周期上报。
 - gateway 提供统一日志查询入口，logdaemon 在内部负责 Docker 日志采集，Kubernetes 下采用 node-local collector + host proxy 查询链路。
 - scalersvc 独立运行，收集 agent 指标并按默认策略扩缩容。
@@ -85,7 +85,7 @@ PATH="$PATH:$HOME/.local/bin" FAAS_BACKEND=k8s ./stop.sh
 ### 组件文档
 
 - [`gateway/README.md`](gateway/README.md)：gateway 入口、queue、router、scheduler、双后端实现。
-- [`runtime/README.md`](runtime/README.md)：runtime-server、runtime-agent、Python bootstrap、容器内调用链路。
+- [`runtime/README.md`](runtime/README.md)：runtime-server、runtime-agent、多语言 bootstrap、容器内调用链路。
 - [`scalersvc/README.md`](scalersvc/README.md)：指标接收、扩缩容策略、决策循环、内部接口协作。
 - [`logdaemon/README.md`](logdaemon/README.md)：docker / collector / proxy 三种模式与日志查询链路。
 
@@ -107,7 +107,12 @@ serverless/
 │   ├── cmd/runtime/main.go     # 容器内 Runtime API server
 │   ├── cmd/agent/main.go       # 容器内 runtime-agent
 │   ├── bootstrap/python3_bootstrap.py
+│   ├── bootstrap/nodejs_bootstrap.js
+│   ├── bootstrap/java/JavaBootstrap.java
 │   ├── examples/python/handler.py
+│   ├── examples/go/main.go
+│   ├── examples/nodejs/handler.js
+│   ├── examples/java/Hello.java
 │   └── entrypoint.sh
 ├── scalersvc/main.go           # 独立自动扩缩容服务
 ├── logdaemon/main.go           # 独立日志采集 daemon
@@ -220,6 +225,15 @@ Python bootstrap 负责：
 5. 执行 `handler(event, context)`。
 6. 将响应或错误发回 Runtime API。
 
+### Runtime Bootstraps
+
+runtime-server 会根据 `FUNCTION_RUNTIME` 选择语言 bootstrap：
+
+- `python3`：运行 `python3 /runtime/bootstrap/python3_bootstrap.py`，加载 `handler.handler` 这类 Python 函数。
+- `go`：运行 `/runtime/bootstrap/go-bootstrap`，再执行用户上传的 `/function/bootstrap` 二进制。
+- `nodejs`：运行 `node /runtime/bootstrap/nodejs_bootstrap.js`，加载 `module.exportName` 这类 CommonJS handler。
+- `java`：运行 `java -cp /runtime/bootstrap/java-bootstrap.jar JavaBootstrap`，通过 `ClassName::methodName` 反射调用 `public static String method(String eventJson)`。
+
 ### Runtime Agent
 
 runtime-agent 运行在每个函数容器内，监听 `:9001`，是 gateway 访问容器的入口：
@@ -285,6 +299,7 @@ Kubernetes 模式下：
 - curl
 - zip / unzip
 - python3
+- JDK / javac（仅 `./test.sh` 编译 Java 示例函数时需要；脚本使用 `javac --release 21` 兼容 runtime 镜像内固定安装的 Java 21 JRE）
 
 ### 启动完整系统（Docker 默认后端）
 
@@ -339,7 +354,7 @@ cd /Users/z/serverless
 - 等待 runtime-agent 指标上报。
 - 注入高 p99 指标触发 scale-up。
 - 验证 queue backlog 触发扩容。
-- 查询函数日志。
+- Node.js bootstrap 单测、Java bootstrap JSON 单测，以及 Python handler、Go bootstrap、Node.js handler、Java reflection handler 的 smoke test。
 
 ### 停止系统
 
@@ -410,8 +425,7 @@ curl 'http://localhost:8080/logs/hello?tail=10'
 - scalersvc 当前指标聚合仍偏简化，容器指标与函数映射还可以更严格。
 - 没有鉴权、租户隔离、配额和审计。
 - Kubernetes 日志链路使用 DaemonSet collector 和 host proxy；proxy 依赖 gateway 实例元数据按 node 路由，仍是学习环境形态而非生产级日志数据面。
-- Runtime API 只实现了最小调用闭环。
-- Python bootstrap 只支持同步 handler，没有依赖安装和多语言 runtime 管理。
+- Runtime API 已支持 Python、Go、Node.js、Java 四种最小语言接入，但仍缺少依赖安装、layer、init hook、streaming response 等能力。
 
 ## 后续改进方向
 
@@ -465,9 +479,8 @@ curl 'http://localhost:8080/logs/hello?tail=10'
 
 ### 6. Runtime 和语言生态
 
-当前只实现 Python bootstrap。后续可以扩展：
+当前 runtime 已覆盖 Python、Go、Node.js、Java 的最小调用闭环，后续可以继续增强：
 
-- Node.js、Go custom runtime。
 - Runtime Interface Client 抽象。
 - handler 初始化阶段和 invoke 阶段分离。
 - init duration、invoke duration 分开上报。
@@ -502,5 +515,5 @@ curl 'http://localhost:8080/logs/hello?tail=10'
 2. 把 Kubernetes log proxy 升级为真正的 collector 直连或 Service/EndpointSlice 路由。
 3. 加函数代码版本、alias 和 rollback。
 4. 增加 Prometheus metrics，统一暴露 gateway、agent、scaler 指标。
-5. 实现 Node.js runtime，验证 Runtime API 抽象是否足够通用。
+5. 完善 Java / Node.js dependency packaging，让用户函数包可以携带或安装第三方依赖。
 6. 用 Service/EndpointSlice 替代本地 Pod port-forward，形成更接近生产的数据面。

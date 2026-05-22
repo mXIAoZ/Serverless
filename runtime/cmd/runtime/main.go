@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -154,8 +155,11 @@ func handleResponse(w http.ResponseWriter, r *http.Request) {
 	}
 	requestID, action := parts[0], parts[1]
 
-	var body json.RawMessage
-	json.NewDecoder(r.Body).Decode(&body)
+	body, err := io.ReadAll(r.Body)
+	if err != nil || !json.Valid(body) {
+		http.Error(w, "invalid response body", http.StatusBadRequest)
+		return
+	}
 
 	statusCode := http.StatusOK
 	if action == "error" {
@@ -173,11 +177,11 @@ func handleResponse(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 }
 
-// startFunction 启动用户函数进程，崩溃后自动重启
+// startFunction starts the selected language bootstrap and restarts it after exit.
 func startFunction() {
-	handler := os.Getenv("FUNCTION_HANDLER") // e.g. "handler.handler"
-	runtime := os.Getenv("FUNCTION_RUNTIME") // e.g. "python3", "node"
-	funcDir := os.Getenv("FUNCTION_DIR")     // e.g. "/function"
+	handler := os.Getenv("FUNCTION_HANDLER")
+	runtime := os.Getenv("FUNCTION_RUNTIME")
+	funcDir := os.Getenv("FUNCTION_DIR")
 
 	if handler == "" {
 		handler = "handler.handler"
@@ -189,12 +193,14 @@ func startFunction() {
 		funcDir = "/function"
 	}
 
-	bootstrapCmd := []string{runtime, fmt.Sprintf("/runtime/bootstrap/%s_bootstrap.py", runtime)}
-	if runtime == "go" {
-		bootstrapCmd = []string{"/runtime/bootstrap/go-bootstrap"}
-	}
-
 	for {
+		bootstrapCmd, err := bootstrapCommand(runtime)
+		if err != nil {
+			log.Printf("[runtime] %v — retrying in 1s", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
 		log.Printf("[runtime] starting function: %s %s (handler=%s, dir=%s)",
 			runtime, strings.Join(bootstrapCmd, " "), handler, funcDir)
 
@@ -203,6 +209,7 @@ func startFunction() {
 		cmd.Env = append(os.Environ(),
 			"RUNTIME_API=http://localhost:9000",
 			"FUNCTION_HANDLER="+handler,
+			"FUNCTION_DIR="+funcDir,
 		)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -211,5 +218,20 @@ func startFunction() {
 			log.Printf("[runtime] function process exited: %v — restarting in 1s", err)
 			time.Sleep(1 * time.Second)
 		}
+	}
+}
+
+func bootstrapCommand(runtime string) ([]string, error) {
+	switch runtime {
+	case "", "python3":
+		return []string{"python3", "/runtime/bootstrap/python3_bootstrap.py"}, nil
+	case "go":
+		return []string{"/runtime/bootstrap/go-bootstrap"}, nil
+	case "nodejs":
+		return []string{"node", "/runtime/bootstrap/nodejs_bootstrap.js"}, nil
+	case "java":
+		return []string{"java", "-cp", "/runtime/bootstrap/java-bootstrap.jar", "JavaBootstrap"}, nil
+	default:
+		return nil, fmt.Errorf("unsupported runtime %q", runtime)
 	}
 }
