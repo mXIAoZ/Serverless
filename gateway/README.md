@@ -105,12 +105,12 @@ gateway/
 ### 指标入口
 
 - `POST /containers/{id}/metrics`
-  - 接收 runtime-agent 上报的容器指标。
+  - 仅注册在 internal listener 上，接收 runtime-agent 上报的容器指标。
   - 如果配置了 `SCALER_ADDR`，会异步转发到 `scalersvc`。
 
 ## 内部接口
 
-这些接口默认是给本机的 `scalersvc` 和 `logdaemon` 用的，没有做鉴权。
+这些接口给本机的 `scalersvc`、`logdaemon`、`mqsvc` 和 runtime-agent 使用；配置 `INTERNAL_API_TOKEN` 后需要 `Authorization: Bearer <token>`。
 
 ### 给 scalersvc 用
 

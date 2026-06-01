@@ -75,14 +75,16 @@ type ScaleStatus struct {
 }
 
 type scaler struct {
-	gatewayAddr string
-	pol         policy
-	mu          sync.RWMutex
-	metrics     map[string]ContainerMetrics // containerID → latest
-	decisions   map[string]*ScaleDecision   // funcName → last decision
-	maxReplicas int
-	minReplicas int
-	store       ScaleStore
+	gatewayAddr  string
+	gatewayToken string
+	client       *http.Client
+	pol          policy
+	mu           sync.RWMutex
+	metrics      map[string]ContainerMetrics // containerID → latest
+	decisions    map[string]*ScaleDecision   // funcName → last decision
+	maxReplicas  int
+	minReplicas  int
+	store        ScaleStore
 }
 
 func newScaler(gatewayAddr string) *scaler {
@@ -105,13 +107,15 @@ func newScaler(gatewayAddr string) *scaler {
 		decisions = make(map[string]*ScaleDecision)
 	}
 	s := &scaler{
-		gatewayAddr: gatewayAddr,
-		pol:         defaultPolicy(),
-		metrics:     metrics,
-		decisions:   decisions,
-		maxReplicas: envInt("MAX_REPLICAS", 5),
-		minReplicas: envInt("MIN_REPLICAS", 0),
-		store:       store,
+		gatewayAddr:  gatewayAddr,
+		gatewayToken: os.Getenv("INTERNAL_API_TOKEN"),
+		client:       &http.Client{Timeout: 10 * time.Second},
+		pol:          defaultPolicy(),
+		metrics:      metrics,
+		decisions:    decisions,
+		maxReplicas:  envInt("MAX_REPLICAS", 5),
+		minReplicas:  envInt("MIN_REPLICAS", 0),
+		store:        store,
 	}
 	go s.evaluateLoop()
 	return s
@@ -253,7 +257,7 @@ func (s *scaler) aggregateMetrics(funcName string) (maxP99, errPct float64) {
 // --- gateway helpers ---
 
 func (s *scaler) functionNames() []string {
-	resp, err := http.Get("http://" + s.gatewayAddr + "/internal/functions")
+	resp, err := s.getGateway("/internal/functions")
 	if err != nil {
 		log.Printf("[scaler] functionNames: %v", err)
 		return nil
@@ -265,7 +269,7 @@ func (s *scaler) functionNames() []string {
 }
 
 func (s *scaler) stats(funcName string) (busy, idle int) {
-	resp, err := http.Get("http://" + s.gatewayAddr + "/internal/stats/" + funcName)
+	resp, err := s.getGateway("/internal/stats/" + funcName)
 	if err != nil {
 		log.Printf("[scaler] stats %s: %v", funcName, err)
 		return
@@ -280,7 +284,7 @@ func (s *scaler) stats(funcName string) (busy, idle int) {
 }
 
 func (s *scaler) containerIDs(funcName string) []string {
-	resp, err := http.Get("http://" + s.gatewayAddr + "/internal/containers/" + funcName)
+	resp, err := s.getGateway("/internal/containers/" + funcName)
 	if err != nil {
 		log.Printf("[scaler] containers %s: %v", funcName, err)
 		return nil
@@ -295,7 +299,7 @@ func (s *scaler) containerIDs(funcName string) []string {
 }
 
 func (s *scaler) queueStatus(funcName string) int {
-	resp, err := http.Get("http://" + s.gatewayAddr + "/internal/queue/" + funcName)
+	resp, err := s.getGateway("/internal/queue/" + funcName)
 	if err != nil {
 		log.Printf("[scaler] queue %s: %v", funcName, err)
 		return 0
@@ -313,12 +317,28 @@ func (s *scaler) queueStatus(funcName string) int {
 
 func (s *scaler) callGateway(method, path string, body io.Reader) {
 	req, _ := http.NewRequest(method, "http://"+s.gatewayAddr+path, body)
-	resp, err := http.DefaultClient.Do(req)
+	s.authorize(req)
+	resp, err := s.client.Do(req)
 	if err != nil {
 		log.Printf("[scaler] %s %s: %v", method, path, err)
 		return
 	}
 	resp.Body.Close()
+}
+
+func (s *scaler) getGateway(path string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+s.gatewayAddr+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	s.authorize(req)
+	return s.client.Do(req)
+}
+
+func (s *scaler) authorize(req *http.Request) {
+	if s.gatewayToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.gatewayToken)
+	}
 }
 
 func (s *scaler) status(funcName string, busy, idle, queued int, dec *ScaleDecision) ScaleStatus {
@@ -397,7 +417,7 @@ func (s *scaler) handleStatus(w http.ResponseWriter, r *http.Request) {
 func main() {
 	gatewayAddr := os.Getenv("GATEWAY_INTERNAL_ADDR")
 	if gatewayAddr == "" {
-		gatewayAddr = "localhost:8080"
+		gatewayAddr = "localhost:8081"
 	}
 	listenAddr := os.Getenv("SCALER_LISTEN")
 	if listenAddr == "" {

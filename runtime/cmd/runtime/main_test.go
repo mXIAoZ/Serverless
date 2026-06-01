@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestBootstrapCommand(t *testing.T) {
@@ -34,5 +35,12 @@ func TestBootstrapCommand(t *testing.T) {
 func TestBootstrapCommandRejectsUnsupportedRuntime(t *testing.T) {
 	if _, err := bootstrapCommand("ruby"); err == nil {
 		t.Fatal("expected unsupported runtime to fail")
+	}
+}
+
+func TestClampTimeoutCapsLargeValues(t *testing.T) {
+	t.Setenv("MAX_FUNCTION_TIMEOUT_SECONDS", "2")
+	if got := clampTimeout(10 * time.Second); got != 2*time.Second {
+		t.Fatalf("clampTimeout = %v, want 2s", got)
 	}
 }

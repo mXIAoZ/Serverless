@@ -252,7 +252,8 @@ bootstrap 调用 `/runtime/invocation/{id}/response` 或 `/error` 时：
 `startReporter()` 每 10 秒做一次：
 
 - 构造 `ContainerMetrics`
-- POST 到 `http://{GATEWAY_ADDR}/containers/{containerID}/metrics`
+- POST 到 `http://{GATEWAY_INTERNAL_ADDR}/containers/{containerID}/metrics`，未配置 `GATEWAY_INTERNAL_ADDR` 时回退到 `GATEWAY_ADDR`。
+- 配置 `INTERNAL_API_TOKEN` 时携带 `Authorization: Bearer <token>`。
 
 这里的 `containerID`：
 

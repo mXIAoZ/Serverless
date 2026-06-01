@@ -26,6 +26,10 @@ func (b *dockerBackend) Start(ctx context.Context, cfg FunctionConfig) (*Runtime
 	if gatewayAddr == "" {
 		gatewayAddr = "host.docker.internal:8080"
 	}
+	gatewayInternalAddr := os.Getenv("GATEWAY_INTERNAL_ADDR")
+	if gatewayInternalAddr == "" {
+		gatewayInternalAddr = "host.docker.internal:8081"
+	}
 
 	name := fmt.Sprintf("faas-%s-%d", dnsLabel(cfg.Name), cfg.Port)
 	body := map[string]any{
@@ -34,6 +38,8 @@ func (b *dockerBackend) Start(ctx context.Context, cfg FunctionConfig) (*Runtime
 			"FUNCTION_HANDLER=" + cfg.Handler,
 			"FUNCTION_RUNTIME=" + cfg.Runtime,
 			"GATEWAY_ADDR=" + gatewayAddr,
+			"GATEWAY_INTERNAL_ADDR=" + gatewayInternalAddr,
+			"INTERNAL_API_TOKEN=" + os.Getenv("INTERNAL_API_TOKEN"),
 		},
 		"Labels": map[string]string{"faas.function": cfg.Name},
 		"HostConfig": map[string]any{

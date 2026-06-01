@@ -50,6 +50,27 @@ func TestHandleResponseRejectsTrailingJSONData(t *testing.T) {
 	}
 }
 
+func TestHandleResponseRejectsUnknownAction(t *testing.T) {
+	id := "unknown-action"
+	result := make(chan invokeResult, 1)
+	inflight.Store(id, result)
+	defer inflight.Delete(id)
+
+	req := httptest.NewRequest(http.MethodPost, "/runtime/invocation/"+id+"/bogus", strings.NewReader(`{"ok":true}`))
+	w := httptest.NewRecorder()
+
+	handleResponse(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	select {
+	case <-result:
+		t.Fatal("unknown action should not complete invocation")
+	case <-time.After(10 * time.Millisecond):
+	}
+}
+
 func TestHandleResponseAcceptsJSONError(t *testing.T) {
 	id := "json-error"
 	result := make(chan invokeResult, 1)

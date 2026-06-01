@@ -4,8 +4,10 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,6 +42,168 @@ func TestRegisterRejectsUnsupportedRuntime(t *testing.T) {
 	if err := s.Register(FunctionConfig{Name: "bad-runtime", Runtime: "ruby"}); err == nil {
 		t.Fatal("expected unsupported runtime to fail")
 	}
+}
+
+func TestRegisterAcceptsMQTrigger(t *testing.T) {
+	s := testScheduler()
+	err := s.Register(FunctionConfig{Name: "mq-fn", Triggers: []TriggerConfig{{
+		ID:      "orders-trigger",
+		Type:    "mq",
+		Enabled: true,
+		MQID:    "rabbitmq-main",
+		Queue:   "orders",
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegisterRejectsInvalidMQTrigger(t *testing.T) {
+	s := testScheduler()
+	err := s.Register(FunctionConfig{Name: "bad-trigger", Triggers: []TriggerConfig{{
+		ID:      "orders-trigger",
+		Type:    "mq",
+		Enabled: true,
+		Queue:   "orders",
+	}}})
+	if err == nil {
+		t.Fatal("expected missing mq_id to fail")
+	}
+}
+
+func TestMQTriggersIncludesFunctionAndTuningFields(t *testing.T) {
+	s := testScheduler()
+	if err := s.Register(FunctionConfig{Name: "mq-fn", Triggers: []TriggerConfig{{
+		ID:             "orders-trigger",
+		Type:           "mq",
+		Enabled:        true,
+		MQID:           "rabbitmq-main",
+		Queue:          "orders",
+		MaxConcurrency: 3,
+		Prefetch:       2,
+		MaxAttempts:    4,
+		RetryBackoffMS: 250,
+		DLQ:            "orders.dlq",
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+	triggers := s.MQTriggers()
+	if len(triggers) != 1 {
+		t.Fatalf("triggers = %d, want 1", len(triggers))
+	}
+	trigger := triggers[0]
+	if trigger.Function != "mq-fn" || trigger.Prefetch != 2 || trigger.RetryBackoffMS != 250 || trigger.DLQ != "orders.dlq" {
+		t.Fatalf("unexpected trigger: %+v", trigger)
+	}
+}
+
+func TestAcquireInstanceLeaseReleasesContainer(t *testing.T) {
+	s := testScheduler()
+	s.functions["lease-fn"] = FunctionConfig{Name: "lease-fn", Timeout: 7, Triggers: []TriggerConfig{{ID: "orders-trigger", Type: "mq", Enabled: true, MQID: "rabbitmq-main", Queue: "orders"}}}
+	c := &container{id: "inst-1", addr: "127.0.0.1:9001", state: stateIdle, funcName: "lease-fn"}
+	s.pool["lease-fn"] = []*container{c}
+
+	lease, err := s.AcquireInstance(AcquireInstanceRequest{
+		Function:  "lease-fn",
+		Source:    "mq",
+		MQID:      "rabbitmq-main",
+		TriggerID: "orders-trigger",
+		MessageID: "msg-1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.LeaseID == "" || lease.InstanceID != "inst-1" || lease.TimeoutSeconds != 7 {
+		t.Fatalf("unexpected lease: %+v", lease)
+	}
+	if c.state != stateBusy {
+		t.Fatalf("container state = %v, want busy", c.state)
+	}
+	if err := s.ReleaseInstance(lease.LeaseID, "success"); err != nil {
+		t.Fatal(err)
+	}
+	if c.state != stateIdle {
+		t.Fatalf("container state = %v, want idle", c.state)
+	}
+	if err := s.ReleaseInstance(lease.LeaseID, "success"); err == nil {
+		t.Fatal("expected second release to fail")
+	}
+}
+
+func TestAcquireInstanceRejectsWrongTrigger(t *testing.T) {
+	s := testScheduler()
+	s.functions["lease-fn"] = FunctionConfig{Name: "lease-fn", Triggers: []TriggerConfig{{ID: "orders-trigger", Type: "mq", Enabled: true, MQID: "rabbitmq-main", Queue: "orders"}}}
+	err := s.ReleaseInstance("missing", "success")
+	if err == nil {
+		t.Fatal("expected missing lease to fail")
+	}
+	_, err = s.AcquireInstance(AcquireInstanceRequest{Function: "lease-fn", Source: "mq", MQID: "wrong", TriggerID: "orders-trigger"})
+	if !errors.Is(err, ErrInvalidTrigger) {
+		t.Fatalf("err = %v, want ErrInvalidTrigger", err)
+	}
+	_, err = s.AcquireInstance(AcquireInstanceRequest{Function: "lease-fn", MQID: "rabbitmq-main", TriggerID: "orders-trigger"})
+	if !errors.Is(err, ErrInvalidTrigger) {
+		t.Fatalf("err = %v, want ErrInvalidTrigger", err)
+	}
+}
+
+func TestReapExpiredLeasesRemovesContainer(t *testing.T) {
+	backend := &recordingBackend{}
+	s := NewForTesting(backend)
+	s.functions["lease-fn"] = FunctionConfig{Name: "lease-fn", Timeout: 1, Triggers: []TriggerConfig{{ID: "orders-trigger", Type: "mq", Enabled: true, MQID: "rabbitmq-main", Queue: "orders"}}}
+	s.AddIdleTestInstance("lease-fn", "inst-1", "127.0.0.1:9001")
+	lease, err := s.AcquireInstance(AcquireInstanceRequest{Function: "lease-fn", Source: "mq", MQID: "rabbitmq-main", TriggerID: "orders-trigger", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.reapExpiredLeases(time.Now().Add(10 * time.Second))
+	if ids := s.ContainerIDs("lease-fn"); len(ids) != 0 {
+		t.Fatalf("container ids = %v, want empty", ids)
+	}
+	backend.waitStopped(t, "inst-1")
+	if err := s.ReleaseInstance(lease.LeaseID, "success"); err == nil {
+		t.Fatal("expected expired lease to be gone")
+	}
+}
+
+func TestAcquireInstanceClampsTimeout(t *testing.T) {
+	s := testScheduler()
+	s.functions["lease-fn"] = FunctionConfig{Name: "lease-fn", Timeout: 7, Triggers: []TriggerConfig{{ID: "orders-trigger", Type: "mq", Enabled: true, MQID: "rabbitmq-main", Queue: "orders"}}}
+	s.pool["lease-fn"] = []*container{{id: "inst-1", addr: "127.0.0.1:9001", state: stateIdle, funcName: "lease-fn"}}
+
+	lease, err := s.AcquireInstance(AcquireInstanceRequest{Function: "lease-fn", Source: "mq", MQID: "rabbitmq-main", TriggerID: "orders-trigger", TimeoutSeconds: 999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.TimeoutSeconds != 7 {
+		t.Fatalf("TimeoutSeconds = %d, want 7", lease.TimeoutSeconds)
+	}
+}
+
+func TestReleaseInstanceRejectsInvalidStatus(t *testing.T) {
+	s := testScheduler()
+	if err := s.ReleaseInstance("lease", "bad"); !errors.Is(err, ErrInvalidLeaseStatus) {
+		t.Fatalf("err = %v, want ErrInvalidLeaseStatus", err)
+	}
+}
+
+func TestReleaseInstanceTimeoutRemovesContainer(t *testing.T) {
+	backend := &recordingBackend{}
+	s := NewForTesting(backend)
+	s.functions["lease-fn"] = FunctionConfig{Name: "lease-fn", Timeout: 7, Triggers: []TriggerConfig{{ID: "orders-trigger", Type: "mq", Enabled: true, MQID: "rabbitmq-main", Queue: "orders"}}}
+	s.AddIdleTestInstance("lease-fn", "inst-1", "127.0.0.1:9001")
+
+	lease, err := s.AcquireInstance(AcquireInstanceRequest{Function: "lease-fn", Source: "mq", MQID: "rabbitmq-main", TriggerID: "orders-trigger"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReleaseInstance(lease.LeaseID, LeaseStatusTimeout); err != nil {
+		t.Fatal(err)
+	}
+	if ids := s.ContainerIDs("lease-fn"); len(ids) != 0 {
+		t.Fatalf("container ids = %v, want empty", ids)
+	}
+	backend.waitStopped(t, "inst-1")
 }
 
 func TestExtractZipRejectsEscapedPath(t *testing.T) {
@@ -202,3 +366,38 @@ func (f fakeFileInfo) Mode() os.FileMode  { return f.mode }
 func (f fakeFileInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeFileInfo) IsDir() bool        { return false }
 func (f fakeFileInfo) Sys() any           { return nil }
+
+type recordingBackend struct {
+	once    sync.Once
+	stopped chan string
+}
+
+func (b *recordingBackend) Name() string { return "recording" }
+
+func (b *recordingBackend) Start(context.Context, FunctionConfig) (*RuntimeInstance, error) {
+	return nil, errors.New("unexpected start")
+}
+
+func (b *recordingBackend) stopChan() chan string {
+	b.once.Do(func() {
+		b.stopped = make(chan string, 1)
+	})
+	return b.stopped
+}
+
+func (b *recordingBackend) Stop(_ context.Context, id string) error {
+	b.stopChan() <- id
+	return nil
+}
+
+func (b *recordingBackend) waitStopped(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case got := <-b.stopChan():
+		if got != want {
+			t.Fatalf("stopped = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("backend did not stop %q", want)
+	}
+}

@@ -90,8 +90,10 @@ k8s 模式下还会进一步：
 ##### 本地端口进程
 
 - `:8080`
+- `:8081`
 - `:9200`
 - `:9300`
+- `:9400`
 
 ##### Kubernetes 后端
 
@@ -111,18 +113,23 @@ Docker 模式下：
 
 - `FAAS_BACKEND=docker`
 - `GATEWAY_ADDR` 默认 `host.docker.internal:8080`
+- `GATEWAY_INTERNAL_LISTEN` 默认 `:8081`，方便本地函数容器访问 internal listener
+- `INTERNAL_API_TOKEN` 默认 `local-internal-token`
 
 Kubernetes 模式下：
 
 - `FAAS_BACKEND=k8s`
 - `GATEWAY_ADDR` 默认 `host.minikube.internal:8080`
+- `GATEWAY_INTERNAL_LISTEN` 默认 `:8081`
+- `INTERNAL_API_TOKEN` 默认 `local-internal-token`
 - `PATH` 里补上 `$HOME/.local/bin`，方便找到本地安装的 `kubectl` / `minikube`
 
 #### scalersvc
 
 统一通过：
 
-- `GATEWAY_INTERNAL_ADDR=localhost:8080`
+- `GATEWAY_INTERNAL_ADDR=localhost:8081`
+- `INTERNAL_API_TOKEN=local-internal-token`
 
 启动本地 scaler。
 
@@ -138,7 +145,8 @@ Kubernetes 模式：
 - 再本地启动：
   - `LOGDAEMON_MODE=proxy`
   - `K8S_NAMESPACE=...`
-  - `GATEWAY_INTERNAL_ADDR=localhost:8080`
+  - `GATEWAY_INTERNAL_ADDR=localhost:8081`
+  - `INTERNAL_API_TOKEN=local-internal-token`
 
 ### 5. k8s collector 部署
 
@@ -160,8 +168,9 @@ Kubernetes 模式：
 - `http://localhost:8080/health`
 - `http://localhost:9300/health`
 - `http://localhost:9200/health`（内部 logdaemon readiness）
+- `http://localhost:9400/health`（仅 `MQ_ENABLED=1` 时等待 mqsvc）
 
-全部成功后才打印服务地址。
+全部成功后才打印服务地址。`MQ_ENABLED=1` 时，脚本会在没有 `RABBITMQ_URL` 的情况下启动本地 `faas-rabbitmq` 容器，并用 `MQ_CONFIG_PATH` 指向 mqsvc 配置。
 
 ## `stop.sh` 详细说明
 
@@ -180,6 +189,7 @@ Kubernetes 模式：
 - `/tmp/faas-gateway.pid`
 - `/tmp/faas-scalersvc.pid`
 - `/tmp/faas-logdaemon.pid`
+- `/tmp/faas-mqsvc.pid`
 
 #### 2. 停运行中的函数实例
 
@@ -217,6 +227,7 @@ Kubernetes 模式：
 - scalersvc 的 p99 / queue 扩缩容判断
 - Node.js bootstrap 单测、Java bootstrap JSON 单测，以及 Python、Go、Node.js、Java runtime 的示例函数 smoke test
 - gateway 日志查询入口与内部 logdaemon 采集链路
+- `MQ_ENABLED=1` 时的 RabbitMQ trigger ack/retry/DLQ 链路
 
 ### 核心环境变量
 
@@ -230,6 +241,10 @@ Kubernetes 模式：
 - `GO_FUNC` 默认 `hello-go`
 - `NODE_FUNC` 默认 `hello-node`
 - `JAVA_FUNC` 默认 `hello-java`
+- `MQ_FUNC` 默认 `hello-mq`
+- `MQ_ENABLED=1` 时启用 RabbitMQ/mqsvc smoke
+- `RABBITMQ_HTTP_URL` 默认 `http://localhost:15672`
+- `RABBITMQ_HTTP_AUTH` 默认 `guest:guest`
 - 本机 `javac`
   - `test.sh` 编译 Java 示例函数时需要；脚本使用 `javac --release 21`，确保本机较新 JDK 编译出的 class 能被 runtime 镜像内固定安装的 Java 21 JRE 加载。
 
@@ -302,19 +317,24 @@ Kubernetes 模式：
   - `action=scale-up`
   - `reason` 含 `queue=`
 
-#### 11. Go runtime smoke test
+#### 11. Bootstrap unit tests
+
+- 运行 Node.js bootstrap 单测。
+- 编译并运行 Java bootstrap JSON 单测。
+
+#### 12. Go runtime smoke test
 
 - 注册 `hello-go`，`runtime=go`。
 - 把 `runtime/examples/go` 编译成 Linux arm64 `/function/bootstrap`。
 - 上传 zip 后调用并断言 `Hello, Gopher!`。
 
-#### 12. Node.js runtime smoke test
+#### 13. Node.js runtime smoke test
 
 - 注册 `hello-node`，`runtime=nodejs`，`handler=handler.handler`。
 - 上传 `runtime/examples/nodejs/handler.js`。
 - 调用并断言 `Hello, Node!` 和 request id。
 
-#### 13. Java runtime smoke test
+#### 14. Java runtime smoke test
 
 - 注册 `hello-java`，`runtime=java`，`handler=Hello::handleRequest`。
 - 先用本机 `javac --release 21` 编译 `runtime/bootstrap/java/JavaBootstrap.java` 和 `runtime/tests/java/JavaBootstrapJsonTest.java`，运行 Java bootstrap JSON 单测。

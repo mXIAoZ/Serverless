@@ -3,16 +3,22 @@ package entrypoints
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"serverless/gateway/queue"
 	"serverless/gateway/scheduler"
 )
 
-func registerAutoscalingRoutes(mux *http.ServeMux, cfg Config, sched *scheduler.Scheduler, qm *queue.Manager) {
+const metricsMaxBodyBytes = 1 << 20
+
+var metricsHTTPClient = &http.Client{Timeout: 5 * time.Second}
+
+func registerMetricsRoutes(mux *http.ServeMux, cfg Config) {
 	mux.HandleFunc("/containers/", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -24,8 +30,14 @@ func registerAutoscalingRoutes(mux *http.ServeMux, cfg Config, sched *scheduler.
 			return
 		}
 
+		req.Body = http.MaxBytesReader(w, req.Body, metricsMaxBodyBytes)
 		body, err := io.ReadAll(req.Body)
 		if err != nil {
+			var maxBytesErr *http.MaxBytesError
+			if errors.As(err, &maxBytesErr) {
+				http.Error(w, "metrics body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "failed to read body", http.StatusBadRequest)
 			return
 		}
@@ -36,6 +48,19 @@ func registerAutoscalingRoutes(mux *http.ServeMux, cfg Config, sched *scheduler.
 		w.WriteHeader(http.StatusNoContent)
 	})
 
+}
+
+func forwardMetrics(scalerAddr, path string, body []byte) {
+	url := "http://" + scalerAddr + "/metrics/" + strings.TrimSuffix(path, "/metrics")
+	resp, err := metricsHTTPClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[gateway] forward metrics to scaler: %v", err)
+		return
+	}
+	resp.Body.Close()
+}
+
+func registerInternalAutoscalingRoutes(mux *http.ServeMux, sched *scheduler.Scheduler, qm *queue.Manager) {
 	mux.HandleFunc("/internal/stats/", func(w http.ResponseWriter, req *http.Request) {
 		if req.Method != http.MethodGet {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -85,14 +110,13 @@ func registerAutoscalingRoutes(mux *http.ServeMux, cfg Config, sched *scheduler.
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(sched.FunctionNames())
 	})
-}
 
-func forwardMetrics(scalerAddr, path string, body []byte) {
-	url := "http://" + scalerAddr + "/metrics/" + strings.TrimSuffix(path, "/metrics")
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("[gateway] forward metrics to scaler: %v", err)
-		return
-	}
-	resp.Body.Close()
+	mux.HandleFunc("/internal/triggers", func(w http.ResponseWriter, req *http.Request) {
+		if req.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(sched.MQTriggers())
+	})
 }

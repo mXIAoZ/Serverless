@@ -19,18 +19,19 @@ type mongoFunctionStore struct {
 }
 
 type functionDocument struct {
-	ID        string    `bson:"_id"`
-	Name      string    `bson:"name"`
-	Image     string    `bson:"image"`
-	Runtime   string    `bson:"runtime"`
-	Timeout   int       `bson:"timeout"`
-	Memory    int       `bson:"memory"`
-	Handler   string    `bson:"handler"`
-	CodeDir   string    `bson:"code_dir"`
-	CodeKey   string    `bson:"code_key"`
-	CodeURL   string    `bson:"code_url"`
-	CreatedAt time.Time `bson:"created_at"`
-	UpdatedAt time.Time `bson:"updated_at"`
+	ID        string          `bson:"_id"`
+	Name      string          `bson:"name"`
+	Image     string          `bson:"image"`
+	Runtime   string          `bson:"runtime"`
+	Timeout   int             `bson:"timeout"`
+	Memory    int             `bson:"memory"`
+	Handler   string          `bson:"handler"`
+	Triggers  []TriggerConfig `bson:"triggers,omitempty"`
+	CodeDir   string          `bson:"code_dir"`
+	CodeKey   string          `bson:"code_key"`
+	CodeURL   string          `bson:"code_url"`
+	CreatedAt time.Time       `bson:"created_at"`
+	UpdatedAt time.Time       `bson:"updated_at"`
 }
 
 func newFunctionStoreFromEnv() (FunctionStore, error) {
@@ -81,15 +82,16 @@ func (s *mongoFunctionStore) LoadFunctions(ctx context.Context) ([]FunctionConfi
 	configs := make([]FunctionConfig, 0, len(docs))
 	for _, doc := range docs {
 		configs = append(configs, FunctionConfig{
-			Name:    doc.Name,
-			Image:   doc.Image,
-			Runtime: doc.Runtime,
-			Timeout: doc.Timeout,
-			Memory:  doc.Memory,
-			Handler: doc.Handler,
-			CodeDir: doc.CodeDir,
-			CodeKey: doc.CodeKey,
-			CodeURL: doc.CodeURL,
+			Name:     doc.Name,
+			Image:    doc.Image,
+			Runtime:  doc.Runtime,
+			Timeout:  doc.Timeout,
+			Memory:   doc.Memory,
+			Handler:  doc.Handler,
+			Triggers: doc.Triggers,
+			CodeDir:  doc.CodeDir,
+			CodeKey:  doc.CodeKey,
+			CodeURL:  doc.CodeURL,
 		})
 	}
 	return configs, nil
@@ -107,6 +109,7 @@ func (s *mongoFunctionStore) SaveFunction(ctx context.Context, cfg FunctionConfi
 		{Key: "timeout", Value: cfg.Timeout},
 		{Key: "memory", Value: cfg.Memory},
 		{Key: "handler", Value: cfg.Handler},
+		{Key: "triggers", Value: cfg.Triggers},
 		{Key: "code_dir", Value: cfg.CodeDir},
 		{Key: "code_key", Value: cfg.CodeKey},
 		{Key: "code_url", Value: cfg.CodeURL},

@@ -23,7 +23,7 @@ cleanup_k8s_log_collector() {
 }
 
 echo "==> stopping services..."
-for pid_file in /tmp/faas-gateway.pid /tmp/faas-scalersvc.pid /tmp/faas-logdaemon.pid; do
+for pid_file in /tmp/faas-gateway.pid /tmp/faas-scalersvc.pid /tmp/faas-logdaemon.pid /tmp/faas-mqsvc.pid; do
   if [ -f "$pid_file" ]; then
     kill "$(cat "$pid_file")" 2>/dev/null || true
     rm "$pid_file"
@@ -38,6 +38,10 @@ if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   pkill -f "kubectl port-forward.*faas-" 2>/dev/null || true
 else
   docker rm -f $(docker ps -aq --filter "label=faas.function") 2>/dev/null || true
+fi
+
+if [ "${MQ_ENABLED:-0}" = "1" ]; then
+  docker rm -f faas-rabbitmq 2>/dev/null || true
 fi
 
 echo "done."

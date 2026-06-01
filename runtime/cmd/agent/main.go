@@ -36,9 +36,42 @@ type agent struct {
 	successes   int64
 	errors      int64
 	latencies   []float64 // rolling window
+	client      *http.Client
 }
 
 var cgroupWarnOnce sync.Once
+
+func newAgent() *agent {
+	return &agent{client: &http.Client{Timeout: agentHTTPTimeout()}}
+}
+
+func (a *agent) httpClient() *http.Client {
+	if a.client != nil {
+		return a.client
+	}
+	return &http.Client{Timeout: agentHTTPTimeout()}
+}
+
+func maxRequestBytes() int64 {
+	return int64(envInt("RUNTIME_MAX_REQUEST_BYTES", 1<<20))
+}
+
+func agentHTTPTimeout() time.Duration {
+	seconds := envInt("RUNTIME_AGENT_HTTP_TIMEOUT_SECONDS", 305)
+	if seconds <= 0 {
+		seconds = 305
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func envInt(key string, def int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return def
+}
 
 func main() {
 	containerID := os.Getenv("CONTAINER_ID")
@@ -49,12 +82,15 @@ func main() {
 		// fallback: hostname is the short container ID in Docker
 		containerID, _ = os.Hostname()
 	}
-	gatewayAddr := os.Getenv("GATEWAY_ADDR")
+	gatewayAddr := os.Getenv("GATEWAY_INTERNAL_ADDR")
 	if gatewayAddr == "" {
-		gatewayAddr = "host.docker.internal:8080"
+		gatewayAddr = os.Getenv("GATEWAY_ADDR")
+	}
+	if gatewayAddr == "" {
+		gatewayAddr = "host.docker.internal:8081"
 	}
 
-	a := &agent{}
+	a := newAgent()
 
 	if gatewayAddr != "" {
 		go a.startReporter(gatewayAddr, containerID)
@@ -64,6 +100,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/invoke", a.handleInvoke)
+	mux.HandleFunc("/events", a.handleEvents)
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/metrics", a.handleMetrics)
 
@@ -75,11 +112,20 @@ func main() {
 
 // handleInvoke proxies POST /invoke to the runtime server and records metrics.
 func (a *agent) handleInvoke(w http.ResponseWriter, r *http.Request) {
+	a.proxyInvocation(w, r, "/invoke")
+}
+
+func (a *agent) handleEvents(w http.ResponseWriter, r *http.Request) {
+	a.proxyInvocation(w, r, "/events")
+}
+
+func (a *agent) proxyInvocation(w http.ResponseWriter, r *http.Request, path string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes())
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "failed to read body", http.StatusBadRequest)
@@ -89,15 +135,19 @@ func (a *agent) handleInvoke(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost,
-		"http://localhost:9000/invoke", bytes.NewReader(body))
+		"http://localhost:9000"+path, bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, "failed to build upstream request", http.StatusInternalServerError)
 		return
 	}
 	req.Header.Set("Content-Type", r.Header.Get("Content-Type"))
 	req.Header.Set("X-Function-Name", r.Header.Get("X-Function-Name"))
+	req.Header.Set("X-Function-Timeout", r.Header.Get("X-Function-Timeout"))
+	req.Header.Set("X-Event-Type", r.Header.Get("X-Event-Type"))
+	req.Header.Set("X-Trigger-ID", r.Header.Get("X-Trigger-ID"))
+	req.Header.Set("X-Message-ID", r.Header.Get("X-Message-ID"))
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := a.httpClient().Do(req)
 	latencyMs := float64(time.Since(start).Microseconds()) / 1000.0
 
 	if err != nil {
@@ -109,7 +159,6 @@ func (a *agent) handleInvoke(w http.ResponseWriter, r *http.Request) {
 
 	a.record(latencyMs, resp.StatusCode < 500)
 
-	// Stream response back verbatim.
 	for k, vs := range resp.Header {
 		for _, v := range vs {
 			w.Header().Add(k, v)
@@ -122,8 +171,14 @@ func (a *agent) handleInvoke(w http.ResponseWriter, r *http.Request) {
 // handleHealth proxies GET /health to the runtime server with retries.
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
+	client := &http.Client{Timeout: agentHTTPTimeout()}
 	for i := 0; i < 3; i++ {
-		resp, err := http.Get("http://localhost:9000/health")
+		req, reqErr := http.NewRequestWithContext(r.Context(), http.MethodGet, "http://localhost:9000/health", nil)
+		if reqErr != nil {
+			http.Error(w, "failed to build health request", http.StatusInternalServerError)
+			return
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			defer resp.Body.Close()
 			body, _ := io.ReadAll(resp.Body)
@@ -198,7 +253,16 @@ func (a *agent) startReporter(gatewayAddr, containerID string) {
 	for range ticker.C {
 		m := a.snapshot(containerID)
 		data, _ := json.Marshal(m)
-		resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+		if err != nil {
+			log.Printf("[agent] report request failed: %v", err)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token := os.Getenv("INTERNAL_API_TOKEN"); token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := a.httpClient().Do(req)
 		if err != nil {
 			log.Printf("[agent] report failed: %v", err)
 			continue

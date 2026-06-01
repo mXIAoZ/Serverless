@@ -4,6 +4,8 @@ set -e
 cd "$(dirname "$0")"
 
 GATEWAY="http://localhost:8080"
+GATEWAY_INTERNAL="http://${GATEWAY_INTERNAL_ADDR:-localhost:8081}"
+INTERNAL_API_TOKEN="${INTERNAL_API_TOKEN:-local-internal-token}"
 SCALER="http://localhost:9300"
 LOGDAEMON_INTERNAL="http://localhost:9200"
 LOGS="$GATEWAY"
@@ -12,6 +14,7 @@ QUEUE_FUNC="hello-queue"
 GO_FUNC="hello-go"
 NODE_FUNC="hello-node"
 JAVA_FUNC="hello-java"
+MQ_FUNC="hello-mq"
 BACKEND="${FAAS_BACKEND:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
 
@@ -21,12 +24,25 @@ ok()  { echo "  [ok] $*"; }
 fail(){ echo "  [FAIL] $*"; exit 1; }
 sep() { echo ""; echo "── $* ──────────────────────────────────────"; }
 json_field() { python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get(sys.argv[1], ""))' "$1"; }
+internal_get() {
+  if [ -n "${INTERNAL_API_TOKEN:-}" ]; then
+    curl -sf -H "Authorization: Bearer $INTERNAL_API_TOKEN" "$@"
+  else
+    curl -sf "$@"
+  fi
+}
 
 # ── 1. 健康检查 ──────────────────────────────────────────────────
 sep "health checks"
 curl -sf $GATEWAY/health >/dev/null && ok "gateway"
 curl -sf $SCALER/health  >/dev/null && ok "scalersvc"
 curl -sf $LOGDAEMON_INTERNAL/health >/dev/null && ok "internal logdaemon"
+
+if [ "${MQ_ENABLED:-0}" = "1" ]; then
+  sep "mqsvc health"
+  curl -sf http://localhost:9400/health >/dev/null && ok "mqsvc"
+  curl -sf http://localhost:9400/metrics | python3 -m json.tool >/dev/null && ok "mqsvc metrics"
+fi
 
 # ── 2. 注册函数 ──────────────────────────────────────────────────
 sep "register function"
@@ -95,7 +111,7 @@ for cid, v in m.items():
 # ── 9. 注入高 p99 触发 scale-up ──────────────────────────────────
 sep "inject high-p99 metrics → trigger scale-up"
 if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
-  CID=$(curl -sf $GATEWAY/internal/containers/$FUNC | python3 -c "
+  CID=$(internal_get $GATEWAY_INTERNAL/internal/containers/$FUNC | python3 -c "
 import sys, json
 containers = json.load(sys.stdin)
 print(containers[0] if containers else '')
@@ -191,9 +207,12 @@ print(f'  total replicas: {d[\"total\"]}')
 import sys, json
 d = json.load(sys.stdin)
 dec = d.get('last_decision') or {}
-assert dec.get('action') == 'scale-up', dec
 reason = dec.get('reason') or ''
-assert 'queue=' in reason or 'queued=' in reason or 'desired=' in reason, dec
+if dec.get('action') == 'scale-up' and ('queue=' in reason or 'queued=' in reason or 'desired=' in reason):
+    raise SystemExit(0)
+if d.get('total', 0) >= int('${MAX_REPLICAS:-5}') and ('queue=' in reason or 'queued=' in reason):
+    raise SystemExit(0)
+raise AssertionError(dec)
 " >/dev/null 2>&1; then
     QUEUE_SCALE_OK=1
     break
@@ -291,7 +310,85 @@ echo "  response: $RESP"
 echo "$RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); assert d['statusCode']==200 and d['message']=='Hello, Java!'" \
   && ok "java runtime response"
 
-# ── 15. 查看日志 ──────────────────────────────────────────────────
+if [ "${MQ_ENABLED:-0}" = "1" ]; then
+  # ── 15. RabbitMQ trigger smoke test ─────────────────────────────────
+  sep "rabbitmq trigger smoke"
+  RABBITMQ_HTTP="${RABBITMQ_HTTP_URL:-http://localhost:15672}"
+  RABBITMQ_HTTP_AUTH="${RABBITMQ_HTTP_AUTH:-guest:guest}"
+  RESP=$(curl -s -X POST $GATEWAY/functions/$MQ_FUNC \
+    -H "Content-Type: application/json" \
+    -d '{"handler":"handler.handler","triggers":[{"id":"orders-trigger","type":"mq","enabled":true,"mq_id":"rabbitmq-main","queue":"orders","max_concurrency":1,"prefetch":1,"max_attempts":2,"retry_backoff_ms":100,"dlq":"orders.dlq"}]}')
+  echo "  $RESP"
+  case "$RESP" in
+    *'already registered'*) echo "  (reusing existing function)" ;;
+  esac
+  MQ_BUILD_DIR="/tmp/faas-mq-example"
+  rm -rf "$MQ_BUILD_DIR"
+  mkdir -p "$MQ_BUILD_DIR"
+  cat > "$MQ_BUILD_DIR/handler.py" <<'MQPY'
+def handler(event, context):
+    if event.get("type") != "mq":
+        raise RuntimeError("unexpected event type")
+    if event.get("source") != "rabbitmq":
+        raise RuntimeError("unexpected event source")
+    if event.get("mq_id") != "rabbitmq-main" or event.get("trigger_id") != "orders-trigger":
+        raise RuntimeError("unexpected trigger identity")
+    body = event.get("body") or {}
+    if isinstance(body, dict) and body.get("fail"):
+        raise RuntimeError("requested failure")
+    return {"statusCode": 200, "message": "mq ok", "requestId": context.aws_request_id}
+MQPY
+  zip -j /tmp/$MQ_FUNC.zip "$MQ_BUILD_DIR/handler.py" -q
+  curl -sf -X PUT $GATEWAY/functions/$MQ_FUNC/code \
+    --data-binary @/tmp/$MQ_FUNC.zip >/dev/null
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    curl -sf -u "$RABBITMQ_HTTP_AUTH" "$RABBITMQ_HTTP/api/overview" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  curl -sf -u "$RABBITMQ_HTTP_AUTH" -H "Content-Type: application/json" \
+    -X PUT "$RABBITMQ_HTTP/api/queues/%2F/orders" -d '{"durable":true}' >/dev/null
+  curl -sf -u "$RABBITMQ_HTTP_AUTH" -H "Content-Type: application/json" \
+    -X PUT "$RABBITMQ_HTTP/api/queues/%2F/orders.dlq" -d '{"durable":true}' >/dev/null
+  curl -sf -u "$RABBITMQ_HTTP_AUTH" -X DELETE "$RABBITMQ_HTTP/api/queues/%2F/orders/contents" >/dev/null
+  curl -sf -u "$RABBITMQ_HTTP_AUTH" -X DELETE "$RABBITMQ_HTTP/api/queues/%2F/orders.dlq/contents" >/dev/null
+
+  TRIGGER_READY=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if curl -sf http://localhost:9400/triggers | python3 -c "import json,sys; assert any(t.get('id') == 'orders-trigger' for t in json.load(sys.stdin))" >/dev/null 2>&1; then
+      TRIGGER_READY=1
+      break
+    fi
+    sleep 1
+  done
+  [ "$TRIGGER_READY" -eq 1 ] || fail "mq trigger was not synced to mqsvc"
+
+  curl -sf -u "$RABBITMQ_HTTP_AUTH" -H "Content-Type: application/json" \
+    -X POST "$RABBITMQ_HTTP/api/exchanges/%2F/amq.default/publish" \
+    -d '{"properties":{"message_id":"ok-1","delivery_mode":2,"content_type":"application/json"},"routing_key":"orders","payload":"{\"orderId\":\"ok-1\"}","payload_encoding":"string"}' >/dev/null
+  curl -sf -u "$RABBITMQ_HTTP_AUTH" -H "Content-Type: application/json" \
+    -X POST "$RABBITMQ_HTTP/api/exchanges/%2F/amq.default/publish" \
+    -d '{"properties":{"message_id":"fail-1","delivery_mode":2,"content_type":"application/json"},"routing_key":"orders","payload":"{\"fail\":true}","payload_encoding":"string"}' >/dev/null
+
+  MQ_OK=0
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+    METRICS=$(curl -sf http://localhost:9400/metrics)
+    DLQ_COUNT=$(curl -sf -u "$RABBITMQ_HTTP_AUTH" "$RABBITMQ_HTTP/api/queues/%2F/orders.dlq" | json_field messages)
+    echo "$METRICS" | python3 -c "
+import json, sys
+m = json.load(sys.stdin).get('orders-trigger') or {}
+assert m.get('acked', 0) >= 1, m
+assert m.get('dlq', 0) >= 1, m
+assert m.get('inflight', 0) == 0, m
+" >/dev/null 2>&1 && [ "${DLQ_COUNT:-0}" -ge 1 ] && MQ_OK=1 && break
+    sleep 1
+  done
+  [ "$MQ_OK" -eq 1 ] || fail "expected mq ack metrics and RabbitMQ DLQ message"
+  curl -sf http://localhost:9400/metrics | python3 -m json.tool
+  ok "rabbitmq ack/retry/dlq"
+fi
+
+# ── 16. 查看日志 ──────────────────────────────────────────────────
 sep "function logs (last 10)"
 if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   LOG_OK=0

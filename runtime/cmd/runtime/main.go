@@ -2,12 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +23,11 @@ type invokeResult struct {
 }
 
 type invocation struct {
-	id      string
-	payload json.RawMessage
-	result  chan invokeResult
+	id        string
+	payload   json.RawMessage
+	eventType string
+	deadline  time.Time
+	result    chan invokeResult
 }
 
 var (
@@ -33,10 +37,47 @@ var (
 	notify   = make(chan struct{}, 1)
 )
 
+func maxRequestBytes() int64 {
+	return int64(envInt("RUNTIME_MAX_REQUEST_BYTES", 1<<20))
+}
+
+func maxQueueSize() int {
+	max := envInt("RUNTIME_MAX_QUEUE", 128)
+	if max <= 0 {
+		return 128
+	}
+	return max
+}
+
+func clampTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return 30 * time.Second
+	}
+	maxSeconds := envInt("MAX_FUNCTION_TIMEOUT_SECONDS", 300)
+	if maxSeconds <= 0 {
+		maxSeconds = 300
+	}
+	maxTimeout := time.Duration(maxSeconds) * time.Second
+	if timeout > maxTimeout {
+		return maxTimeout
+	}
+	return timeout
+}
+
+func envInt(key string, def int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return def
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", handleHealth)
 	mux.HandleFunc("/invoke", handleInvoke)
+	mux.HandleFunc("/events", handleEvents)
 	mux.HandleFunc("/runtime/invocation/next", handleNext)
 	mux.HandleFunc("/runtime/invocation/", handleResponse)
 
@@ -55,24 +96,56 @@ func handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func handleInvoke(w http.ResponseWriter, r *http.Request) {
+	handleInvocation(w, r, "http")
+}
+
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+	handleInvocation(w, r, "mq")
+}
+
+func handleInvocation(w http.ResponseWriter, r *http.Request, eventType string) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	var payload json.RawMessage
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes())
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		if eventType == "mq" {
+			http.Error(w, "invalid event body", http.StatusBadRequest)
+			return
+		}
 		payload = json.RawMessage(`{}`)
 	}
 
-	inv := &invocation{
-		id:      uuid.NewString(),
-		payload: payload,
-		result:  make(chan invokeResult, 1),
+	timeout := 30 * time.Second
+	if t := r.Header.Get("X-Function-Timeout"); t != "" {
+		if d, err := time.ParseDuration(t + "s"); err == nil {
+			timeout = clampTimeout(d)
+		}
 	}
-	inflight.Store(inv.id, inv.result)
+
+	inv := &invocation{
+		id:        uuid.NewString(),
+		payload:   payload,
+		eventType: eventType,
+		deadline:  time.Now().Add(timeout),
+		result:    make(chan invokeResult, 1),
+	}
 
 	mu.Lock()
+	if len(queue) >= maxQueueSize() {
+		mu.Unlock()
+		http.Error(w, "runtime queue full", http.StatusServiceUnavailable)
+		return
+	}
+	inflight.Store(inv.id, inv.result)
 	queue = append(queue, inv)
 	mu.Unlock()
 
@@ -81,14 +154,7 @@ func handleInvoke(w http.ResponseWriter, r *http.Request) {
 	default:
 	}
 
-	log.Printf("[invoke] queued %s", inv.id)
-
-	timeout := 30 * time.Second
-	if t := r.Header.Get("X-Function-Timeout"); t != "" {
-		if d, err := time.ParseDuration(t + "s"); err == nil {
-			timeout = d
-		}
-	}
+	log.Printf("[%s] queued %s", eventType, inv.id)
 
 	select {
 	case res := <-inv.result:
@@ -100,9 +166,21 @@ func handleInvoke(w http.ResponseWriter, r *http.Request) {
 		})
 	case <-time.After(timeout):
 		inflight.Delete(inv.id)
+		removeQueuedInvocation(inv.id)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusGatewayTimeout)
 		json.NewEncoder(w).Encode(map[string]string{"error": "function timeout"})
+	}
+}
+
+func removeQueuedInvocation(id string) {
+	mu.Lock()
+	defer mu.Unlock()
+	for i, inv := range queue {
+		if inv.id == id {
+			queue = append(queue[:i], queue[i+1:]...)
+			return
+		}
 	}
 }
 
@@ -117,11 +195,17 @@ func handleNext(w http.ResponseWriter, r *http.Request) {
 		if len(queue) > 0 {
 			inv := queue[0]
 			queue = queue[1:]
+			if time.Now().After(inv.deadline) {
+				mu.Unlock()
+				inflight.Delete(inv.id)
+				continue
+			}
 			mu.Unlock()
 
 			w.Header().Set("Lambda-Runtime-Aws-Request-Id", inv.id)
 			w.Header().Set("Lambda-Runtime-Deadline-Ms",
-				fmt.Sprintf("%d", time.Now().Add(30*time.Second).UnixMilli()))
+				fmt.Sprintf("%d", inv.deadline.UnixMilli()))
+			w.Header().Set("Lambda-Runtime-Event-Type", inv.eventType)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
 			w.Write(inv.payload)
@@ -154,7 +238,12 @@ func handleResponse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	requestID, action := parts[0], parts[1]
+	if action != "response" && action != "error" {
+		http.Error(w, "invalid response action", http.StatusBadRequest)
+		return
+	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes())
 	body, err := io.ReadAll(r.Body)
 	if err != nil || !json.Valid(body) {
 		http.Error(w, "invalid response body", http.StatusBadRequest)

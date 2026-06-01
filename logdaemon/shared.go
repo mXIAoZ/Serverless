@@ -289,11 +289,12 @@ func parseTail(r *http.Request, def int) int {
 }
 
 type proxyClient struct {
-	gatewayAddr string
-	namespace   string
-	httpClient  *http.Client
-	k8sClient   kubernetes.Interface
-	restConfig  *rest.Config
+	gatewayAddr  string
+	gatewayToken string
+	namespace    string
+	httpClient   *http.Client
+	k8sClient    kubernetes.Interface
+	restConfig   *rest.Config
 }
 
 type instanceInfo struct {
@@ -315,18 +316,19 @@ func newProxyClient() *proxyClient {
 	}
 	gatewayAddr := os.Getenv("GATEWAY_INTERNAL_ADDR")
 	if gatewayAddr == "" {
-		gatewayAddr = "localhost:8080"
+		gatewayAddr = "localhost:8081"
 	}
 	client, restConfig, err := newK8sClient()
 	if err != nil {
 		log.Fatalf("[daemon] k8s client: %v", err)
 	}
 	return &proxyClient{
-		gatewayAddr: gatewayAddr,
-		namespace:   ns,
-		httpClient:  &http.Client{Timeout: 10 * time.Second},
-		k8sClient:   client,
-		restConfig:  restConfig,
+		gatewayAddr:  gatewayAddr,
+		gatewayToken: os.Getenv("INTERNAL_API_TOKEN"),
+		namespace:    ns,
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		k8sClient:    client,
+		restConfig:   restConfig,
 	}
 }
 
@@ -431,7 +433,14 @@ func (p *proxyClient) streamLogs(w http.ResponseWriter, r *http.Request, funcNam
 }
 
 func (p *proxyClient) instances(funcName string) ([]instanceInfo, error) {
-	resp, err := p.httpClient.Get("http://" + p.gatewayAddr + "/internal/instances/" + funcName)
+	req, err := http.NewRequest(http.MethodGet, "http://"+p.gatewayAddr+"/internal/instances/"+funcName, nil)
+	if err != nil {
+		return nil, err
+	}
+	if p.gatewayToken != "" {
+		req.Header.Set("Authorization", "Bearer "+p.gatewayToken)
+	}
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

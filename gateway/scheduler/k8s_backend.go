@@ -225,6 +225,10 @@ func (b *k8sBackend) podSpec(podName string, cfg FunctionConfig) *corev1.Pod {
 	if gatewayAddr == "" {
 		gatewayAddr = "host.minikube.internal:8080"
 	}
+	gatewayInternalAddr := os.Getenv("GATEWAY_INTERNAL_ADDR")
+	if gatewayInternalAddr == "" {
+		gatewayInternalAddr = "host.minikube.internal:8081"
+	}
 
 	container := corev1.Container{
 		Name:            "runtime",
@@ -237,6 +241,8 @@ func (b *k8sBackend) podSpec(podName string, cfg FunctionConfig) *corev1.Pod {
 			{Name: "FUNCTION_HANDLER", Value: cfg.Handler},
 			{Name: "FUNCTION_RUNTIME", Value: cfg.Runtime},
 			{Name: "GATEWAY_ADDR", Value: gatewayAddr},
+			{Name: "GATEWAY_INTERNAL_ADDR", Value: gatewayInternalAddr},
+			{Name: "INTERNAL_API_TOKEN", Value: os.Getenv("INTERNAL_API_TOKEN")},
 			{Name: "CONTAINER_ID", Value: podName},
 		},
 		Resources: corev1.ResourceRequirements{

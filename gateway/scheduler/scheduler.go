@@ -11,23 +11,96 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // FunctionConfig 函数注册信息
 type FunctionConfig struct {
-	Name    string `json:"name"`
-	Image   string `json:"image"`
-	Runtime string `json:"runtime"`
-	Timeout int    `json:"timeout"`
-	Memory  int    `json:"memory"`
-	Handler string `json:"handler"` // e.g. "handler.handler"
-	CodeDir string `json:"-"`       // 解压后的代码目录，由 UploadCode 设置
-	CodeKey string `json:"-"`
-	CodeURL string `json:"-"`
-	Port    int    `json:"-"`
+	Name     string          `json:"name"`
+	Image    string          `json:"image"`
+	Runtime  string          `json:"runtime"`
+	Timeout  int             `json:"timeout"`
+	Memory   int             `json:"memory"`
+	Handler  string          `json:"handler"` // e.g. "handler.handler"
+	Triggers []TriggerConfig `json:"triggers,omitempty"`
+	CodeDir  string          `json:"-"` // 解压后的代码目录，由 UploadCode 设置
+	CodeKey  string          `json:"-"`
+	CodeURL  string          `json:"-"`
+	Port     int             `json:"-"`
+}
+
+type TriggerConfig struct {
+	ID             string `json:"id" bson:"id"`
+	Type           string `json:"type" bson:"type"`
+	Enabled        bool   `json:"enabled" bson:"enabled"`
+	MQID           string `json:"mq_id" bson:"mq_id"`
+	Queue          string `json:"queue" bson:"queue"`
+	MaxConcurrency int    `json:"max_concurrency,omitempty" bson:"max_concurrency,omitempty"`
+	Prefetch       int    `json:"prefetch,omitempty" bson:"prefetch,omitempty"`
+	MaxAttempts    int    `json:"max_attempts,omitempty" bson:"max_attempts,omitempty"`
+	RetryBackoffMS int    `json:"retry_backoff_ms,omitempty" bson:"retry_backoff_ms,omitempty"`
+	DLQ            string `json:"dlq,omitempty" bson:"dlq,omitempty"`
+}
+
+type MQTrigger struct {
+	ID             string `json:"id"`
+	Type           string `json:"type"`
+	Enabled        bool   `json:"enabled"`
+	MQID           string `json:"mq_id"`
+	Queue          string `json:"queue"`
+	Function       string `json:"function"`
+	MaxConcurrency int    `json:"max_concurrency,omitempty"`
+	Prefetch       int    `json:"prefetch,omitempty"`
+	MaxAttempts    int    `json:"max_attempts,omitempty"`
+	RetryBackoffMS int    `json:"retry_backoff_ms,omitempty"`
+	DLQ            string `json:"dlq,omitempty"`
+}
+
+type AcquireInstanceRequest struct {
+	Function       string
+	Source         string
+	MQID           string
+	TriggerID      string
+	MessageID      string
+	TimeoutSeconds int
+}
+
+type InstanceLease struct {
+	LeaseID        string `json:"lease_id"`
+	Function       string `json:"function"`
+	InstanceID     string `json:"instance_id"`
+	Address        string `json:"address"`
+	TimeoutSeconds int    `json:"timeout_seconds"`
+	Source         string `json:"source,omitempty"`
+	MQID           string `json:"mq_id,omitempty"`
+	TriggerID      string `json:"trigger_id,omitempty"`
+	MessageID      string `json:"message_id,omitempty"`
+}
+
+var (
+	ErrFunctionNotFound   = errors.New("function not found")
+	ErrInvalidTrigger     = errors.New("invalid trigger")
+	ErrLeaseNotFound      = errors.New("lease not found")
+	ErrInvalidLeaseStatus = errors.New("invalid lease status")
+)
+
+const (
+	LeaseStatusSuccess   = "success"
+	LeaseStatusError     = "error"
+	LeaseStatusTimeout   = "timeout"
+	LeaseStatusAbandoned = "abandoned"
+)
+
+type leaseRecord struct {
+	lease    InstanceLease
+	instance *container
+	deadline time.Time
+	released bool
 }
 
 // containerState 容器状态
@@ -58,6 +131,7 @@ type Scheduler struct {
 	backend   RuntimeBackend
 	store     FunctionStore
 	codeStore CodeStore
+	leases    map[string]*leaseRecord
 }
 
 func New() *Scheduler {
@@ -77,6 +151,7 @@ func New() *Scheduler {
 		backend:   backend,
 		store:     store,
 		codeStore: codeStore,
+		leases:    make(map[string]*leaseRecord),
 	}
 	if configs, err := store.LoadFunctions(context.Background()); err != nil {
 		log.Fatalf("[scheduler] load functions: %v", err)
@@ -88,6 +163,28 @@ func New() *Scheduler {
 	log.Printf("[scheduler] backend=%s", backend.Name())
 	go s.reaper()
 	return s
+}
+
+func NewForTesting(backend RuntimeBackend) *Scheduler {
+	return &Scheduler{
+		functions: make(map[string]FunctionConfig),
+		pool:      make(map[string][]*container),
+		backend:   backend,
+		store:     newMemoryFunctionStore(),
+		leases:    make(map[string]*leaseRecord),
+	}
+}
+
+func (s *Scheduler) AddIdleTestInstance(funcName, id, addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pool[funcName] = append(s.pool[funcName], &container{
+		id:       id,
+		addr:     addr,
+		state:    stateIdle,
+		lastUsed: time.Now(),
+		funcName: funcName,
+	})
 }
 
 func newRuntimeBackend() RuntimeBackend {
@@ -121,6 +218,9 @@ func (s *Scheduler) Register(cfg FunctionConfig) error {
 	if cfg.Handler == "" {
 		cfg.Handler = "handler.handler"
 	}
+	if err := validateTriggers(cfg.Triggers); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	if _, exists := s.functions[cfg.Name]; exists {
 		s.mu.Unlock()
@@ -145,6 +245,47 @@ func isSupportedRuntime(runtime string) bool {
 	default:
 		return false
 	}
+}
+
+func validateTriggers(triggers []TriggerConfig) error {
+	seen := make(map[string]struct{}, len(triggers))
+	for _, trigger := range triggers {
+		if trigger.ID == "" {
+			return errors.New("trigger id is required")
+		}
+		if trigger.ID != dnsLabel(trigger.ID) {
+			return fmt.Errorf("invalid trigger id %q", trigger.ID)
+		}
+		if _, exists := seen[trigger.ID]; exists {
+			return fmt.Errorf("duplicate trigger id %q", trigger.ID)
+		}
+		seen[trigger.ID] = struct{}{}
+		if trigger.Type != "mq" {
+			return fmt.Errorf("unsupported trigger type %q", trigger.Type)
+		}
+		if trigger.MaxConcurrency < 0 {
+			return fmt.Errorf("trigger %q max_concurrency must be >= 0", trigger.ID)
+		}
+		if trigger.Prefetch < 0 {
+			return fmt.Errorf("trigger %q prefetch must be >= 0", trigger.ID)
+		}
+		if trigger.MaxAttempts < 0 {
+			return fmt.Errorf("trigger %q max_attempts must be >= 0", trigger.ID)
+		}
+		if trigger.RetryBackoffMS < 0 {
+			return fmt.Errorf("trigger %q retry_backoff_ms must be >= 0", trigger.ID)
+		}
+		if !trigger.Enabled {
+			continue
+		}
+		if trigger.MQID == "" {
+			return fmt.Errorf("trigger %q requires mq_id", trigger.ID)
+		}
+		if trigger.Queue == "" {
+			return fmt.Errorf("trigger %q requires queue", trigger.ID)
+		}
+	}
+	return nil
 }
 
 func (s *Scheduler) Deregister(name string) {
@@ -293,6 +434,33 @@ func (s *Scheduler) Get(name string) (FunctionConfig, bool) {
 	return cfg, ok
 }
 
+func (s *Scheduler) MQTriggers() []MQTrigger {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	triggers := make([]MQTrigger, 0)
+	for _, cfg := range s.functions {
+		for _, trigger := range cfg.Triggers {
+			if trigger.Type != "mq" || !trigger.Enabled {
+				continue
+			}
+			triggers = append(triggers, MQTrigger{
+				ID:             trigger.ID,
+				Type:           trigger.Type,
+				Enabled:        trigger.Enabled,
+				MQID:           trigger.MQID,
+				Queue:          trigger.Queue,
+				Function:       cfg.Name,
+				MaxConcurrency: trigger.MaxConcurrency,
+				Prefetch:       trigger.Prefetch,
+				MaxAttempts:    trigger.MaxAttempts,
+				RetryBackoffMS: trigger.RetryBackoffMS,
+				DLQ:            trigger.DLQ,
+			})
+		}
+	}
+	return triggers
+}
+
 // Addr 返回容器的 host:port 地址
 func (c *container) Addr() string { return c.addr }
 
@@ -302,7 +470,7 @@ func (s *Scheduler) Acquire(name string) (*container, error) {
 	cfg, ok := s.functions[name]
 	if !ok {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("function %q not registered", name)
+		return nil, fmt.Errorf("%w: %q", ErrFunctionNotFound, name)
 	}
 
 	for _, c := range s.pool[name] {
@@ -328,6 +496,155 @@ func (s *Scheduler) Acquire(name string) (*container, error) {
 	s.mu.Unlock()
 
 	return c, nil
+}
+
+func (s *Scheduler) AcquireInstance(req AcquireInstanceRequest) (InstanceLease, error) {
+	cfg, ok := s.Get(req.Function)
+	if !ok {
+		return InstanceLease{}, fmt.Errorf("%w: %q", ErrFunctionNotFound, req.Function)
+	}
+	if err := validateAcquireTrigger(cfg, req); err != nil {
+		return InstanceLease{}, err
+	}
+
+	c, err := s.Acquire(req.Function)
+	if err != nil {
+		return InstanceLease{}, err
+	}
+	req.TimeoutSeconds = clampLeaseTimeout(req.TimeoutSeconds, cfg.Timeout)
+	lease := InstanceLease{
+		LeaseID:        uuid.NewString(),
+		Function:       req.Function,
+		InstanceID:     c.id,
+		Address:        c.addr,
+		TimeoutSeconds: req.TimeoutSeconds,
+		Source:         req.Source,
+		MQID:           req.MQID,
+		TriggerID:      req.TriggerID,
+		MessageID:      req.MessageID,
+	}
+	s.mu.Lock()
+	if s.leases == nil {
+		s.leases = make(map[string]*leaseRecord)
+	}
+	s.leases[lease.LeaseID] = &leaseRecord{
+		lease:    lease,
+		instance: c,
+		deadline: time.Now().Add(time.Duration(req.TimeoutSeconds)*time.Second + 5*time.Second),
+	}
+	s.mu.Unlock()
+	return lease, nil
+}
+
+func clampLeaseTimeout(requested int, functionTimeout int) int {
+	maxTimeout := functionTimeout
+	if maxTimeout <= 0 {
+		maxTimeout = envInt("MAX_FUNCTION_TIMEOUT_SECONDS", 300)
+	}
+	if maxTimeout <= 0 {
+		maxTimeout = 300
+	}
+	timeout := requested
+	if timeout <= 0 {
+		timeout = functionTimeout
+	}
+	if timeout <= 0 {
+		timeout = 30
+	}
+	if timeout < 1 {
+		timeout = 1
+	}
+	if timeout > maxTimeout {
+		timeout = maxTimeout
+	}
+	return timeout
+}
+
+func isValidLeaseStatus(status string) bool {
+	switch status {
+	case LeaseStatusSuccess, LeaseStatusError, LeaseStatusTimeout, LeaseStatusAbandoned:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateAcquireTrigger(cfg FunctionConfig, req AcquireInstanceRequest) error {
+	if req.Source != "mq" || req.MQID == "" || req.TriggerID == "" {
+		return fmt.Errorf("%w: function %q source %q trigger %q mq_id %q", ErrInvalidTrigger, req.Function, req.Source, req.TriggerID, req.MQID)
+	}
+	for _, trigger := range cfg.Triggers {
+		if trigger.ID == req.TriggerID && trigger.MQID == req.MQID && trigger.Type == "mq" && trigger.Enabled {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: function %q trigger %q mq_id %q", ErrInvalidTrigger, req.Function, req.TriggerID, req.MQID)
+}
+
+func (s *Scheduler) ReleaseInstance(leaseID string, status string) error {
+	if !isValidLeaseStatus(status) {
+		return fmt.Errorf("%w: %q", ErrInvalidLeaseStatus, status)
+	}
+	var stopID string
+	s.mu.Lock()
+	if err := s.releaseInstanceLocked(leaseID, status, time.Now(), &stopID); err != nil {
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+	if stopID != "" {
+		go s.stop(stopID)
+	}
+	return nil
+}
+
+func (s *Scheduler) releaseInstanceLocked(leaseID string, status string, now time.Time, stopID *string) error {
+	record, ok := s.leases[leaseID]
+	if !ok || record.released {
+		return fmt.Errorf("%w: %q", ErrLeaseNotFound, leaseID)
+	}
+	record.released = true
+	delete(s.leases, leaseID)
+	if status == LeaseStatusTimeout || status == LeaseStatusAbandoned {
+		s.removeInstanceLocked(record.instance)
+		if stopID != nil {
+			*stopID = record.instance.id
+		}
+		return nil
+	}
+	record.instance.state = stateIdle
+	record.instance.lastUsed = now
+	return nil
+}
+
+func (s *Scheduler) removeInstanceLocked(target *container) {
+	containers := s.pool[target.funcName]
+	for i, c := range containers {
+		if c == target || c.id == target.id {
+			s.pool[target.funcName] = append(containers[:i], containers[i+1:]...)
+			return
+		}
+	}
+}
+
+func (s *Scheduler) reapExpiredLeases(now time.Time) {
+	var stops []string
+	s.mu.Lock()
+	for leaseID, record := range s.leases {
+		if now.After(record.deadline) {
+			var stopID string
+			if err := s.releaseInstanceLocked(leaseID, LeaseStatusTimeout, now, &stopID); err != nil {
+				log.Printf("[scheduler] release expired lease %s: %v", leaseID, err)
+			}
+			if stopID != "" {
+				stops = append(stops, stopID)
+			}
+		}
+	}
+	s.mu.Unlock()
+	for _, id := range stops {
+		go s.stop(id)
+	}
 }
 
 // Release 将容器标记为 idle，供下次复用
@@ -409,7 +726,8 @@ func waitReady(ctx context.Context, addr string, timeout time.Duration) error {
 func (s *Scheduler) reaper() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
-	for range ticker.C {
+	for now := range ticker.C {
+		s.reapExpiredLeases(now)
 		s.mu.Lock()
 		var stops []string
 		for name, containers := range s.pool {
@@ -543,4 +861,13 @@ func (s *Scheduler) RemoveIdle(funcName string) bool {
 	go s.stop(c.id)
 	log.Printf("[scheduler] scale-down removed idle container %s for %s", c.id, funcName)
 	return true
+}
+
+func envInt(key string, def int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
+	}
+	return def
 }

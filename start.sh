@@ -6,6 +6,7 @@ cd "$(dirname "$0")"
 
 BACKEND="${FAAS_BACKEND:-docker}"
 K8S_NAMESPACE="${K8S_NAMESPACE:-default}"
+INTERNAL_API_TOKEN="${INTERNAL_API_TOKEN:-local-internal-token}"
 
 start_k8s_minio() {
   echo "==> deploying MinIO code store..."
@@ -51,6 +52,7 @@ echo "==> building binaries..."
 go build -o bin/gateway       ./gateway/
 go build -o bin/scalersvc     ./scalersvc/
 go build -o bin/logdaemon     ./logdaemon/
+go build -o bin/mqsvc         ./mqsvc/
 GOOS=linux GOARCH=arm64 go build -o bin/logdaemon-linux ./logdaemon/
 
 echo "==> cross-compiling runtime for Linux..."
@@ -70,8 +72,10 @@ fi
 # ── 2. 清理残留进程和实例 ────────────────────────────────────────
 echo "==> cleaning up..."
 lsof -ti :8080 | xargs kill -9 2>/dev/null || true
+lsof -ti :8081 | xargs kill -9 2>/dev/null || true
 lsof -ti :9200 | xargs kill -9 2>/dev/null || true
 lsof -ti :9300 | xargs kill -9 2>/dev/null || true
+lsof -ti :9400 | xargs kill -9 2>/dev/null || true
 if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   kubectl delete pod -n "$K8S_NAMESPACE" -l faas.managed-by=local-faas --ignore-not-found=true >/dev/null
   kubectl delete -f /tmp/faas-logdaemon.yaml --ignore-not-found=true >/dev/null 2>&1 || true
@@ -95,6 +99,8 @@ if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   K8S_NAMESPACE="$K8S_NAMESPACE" \
   GATEWAY_ADDR="${GATEWAY_ADDR:-host.minikube.internal:8080}" \
   SCALER_ADDR="localhost:9300" \
+  GATEWAY_INTERNAL_LISTEN="${GATEWAY_INTERNAL_LISTEN:-:8081}" \
+  INTERNAL_API_TOKEN="$INTERNAL_API_TOKEN" \
   MONGO_URI="$MONGO_URI" \
   MONGO_DB="$MONGO_DB" \
   MONGO_TIMEOUT_MS="$MONGO_TIMEOUT_MS" \
@@ -113,6 +119,8 @@ else
   FAAS_BACKEND="$BACKEND" \
   GATEWAY_ADDR="${GATEWAY_ADDR:-host.docker.internal:8080}" \
   SCALER_ADDR="localhost:9300" \
+  GATEWAY_INTERNAL_LISTEN="${GATEWAY_INTERNAL_LISTEN:-:8081}" \
+  INTERNAL_API_TOKEN="$INTERNAL_API_TOKEN" \
   MONGO_URI="$MONGO_URI" \
   MONGO_DB="$MONGO_DB" \
   MONGO_TIMEOUT_MS="$MONGO_TIMEOUT_MS" \
@@ -121,7 +129,8 @@ fi
 echo $! > /tmp/faas-gateway.pid
 
 echo "==> starting scalersvc (:9300)..."
-GATEWAY_INTERNAL_ADDR="localhost:8080" \
+GATEWAY_INTERNAL_ADDR="${GATEWAY_INTERNAL_ADDR:-localhost:8081}" \
+INTERNAL_API_TOKEN="$INTERNAL_API_TOKEN" \
 MONGO_URI="$MONGO_URI" \
 MONGO_DB="$MONGO_DB" \
 MONGO_TIMEOUT_MS="$MONGO_TIMEOUT_MS" \
@@ -133,7 +142,8 @@ if [ "$BACKEND" = "k8s" ] || [ "$BACKEND" = "kubernetes" ]; then
   echo "==> starting logdaemon proxy (:9200)..."
   LOGDAEMON_MODE="proxy" \
   K8S_NAMESPACE="$K8S_NAMESPACE" \
-  GATEWAY_INTERNAL_ADDR="localhost:8080" \
+  GATEWAY_INTERNAL_ADDR="${GATEWAY_INTERNAL_ADDR:-localhost:8081}" \
+  INTERNAL_API_TOKEN="$INTERNAL_API_TOKEN" \
   PATH="$PATH:$HOME/.local/bin" \
     ./bin/logdaemon &
 else
@@ -142,19 +152,56 @@ else
 fi
 echo $! > /tmp/faas-logdaemon.pid
 
+if [ "${MQ_ENABLED:-0}" = "1" ]; then
+  if [ -z "${RABBITMQ_URL:-}" ]; then
+    echo "==> starting RabbitMQ container..."
+    docker rm -f faas-rabbitmq >/dev/null 2>&1 || true
+    docker run -d --name faas-rabbitmq -p 127.0.0.1:5672:5672 -p 127.0.0.1:15672:15672 rabbitmq:3-management >/dev/null
+    RABBITMQ_URL="amqp://guest:guest@localhost:5672/"
+    for _ in {1..160}; do
+      docker exec -u rabbitmq faas-rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    docker exec -u rabbitmq faas-rabbitmq rabbitmq-diagnostics -q ping >/dev/null 2>&1 || { echo "RabbitMQ did not become ready" >&2; docker logs faas-rabbitmq >&2 || true; exit 1; }
+  fi
+  if [ -z "${MQ_CONFIG_PATH:-}" ]; then
+    MQ_CONFIG_PATH="/tmp/faas-mqsvc.json"
+    cat > "$MQ_CONFIG_PATH" <<EOF
+{"gateway_addr":"${GATEWAY_INTERNAL_ADDR:-localhost:8081}","mq_instances":[{"mq_id":"rabbitmq-main","broker":"rabbitmq","url":"$RABBITMQ_URL"}],"triggers":[]}
+EOF
+  elif [ ! -f "$MQ_CONFIG_PATH" ]; then
+    cat > "$MQ_CONFIG_PATH" <<EOF
+{"gateway_addr":"${GATEWAY_INTERNAL_ADDR:-localhost:8081}","mq_instances":[{"mq_id":"rabbitmq-main","broker":"rabbitmq","url":"$RABBITMQ_URL"}],"triggers":[]}
+EOF
+  fi
+  echo "==> starting mqsvc (:9400)..."
+  GATEWAY_INTERNAL_ADDR="${GATEWAY_INTERNAL_ADDR:-localhost:8081}" \
+  INTERNAL_API_TOKEN="$INTERNAL_API_TOKEN" \
+  MQ_CONFIG_PATH="$MQ_CONFIG_PATH" \
+    ./bin/mqsvc &
+  echo $! > /tmp/faas-mqsvc.pid
+fi
+
 # ── 4. 等待就绪 ──────────────────────────────────────────────────
 echo -n "==> waiting for services..."
 until curl -sf http://localhost:8080/health >/dev/null 2>&1; do echo -n "."; sleep 0.3; done
 until curl -sf http://localhost:9300/health >/dev/null 2>&1; do echo -n "."; sleep 0.3; done
 until curl -sf http://localhost:9200/health >/dev/null 2>&1; do echo -n "."; sleep 0.3; done
+if [ "${MQ_ENABLED:-0}" = "1" ]; then
+  until curl -sf http://localhost:9400/health >/dev/null 2>&1; do echo -n "."; sleep 0.3; done
+fi
 echo " ready"
 
 echo ""
 echo "Services running:"
 echo "  gateway    http://localhost:8080"
 echo "  logs       http://localhost:8080/logs/{function}"
+echo "  gateway internal http://${GATEWAY_INTERNAL_ADDR:-localhost:8081}"
 echo "  internal scalersvc  http://localhost:9300"
 echo "  internal logdaemon  http://localhost:9200"
+if [ "${MQ_ENABLED:-0}" = "1" ]; then
+  echo "  mqsvc      http://localhost:9400"
+fi
 echo "  backend    $BACKEND"
 echo ""
 echo "Run ./test.sh to deploy and test a function."
